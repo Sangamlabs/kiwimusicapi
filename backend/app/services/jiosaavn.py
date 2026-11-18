@@ -143,7 +143,55 @@ class JioSaavnProvider(MusicProvider):
         return []
 
     @staticmethod
-    def _generate_search_candidates(raw_title: str) -> list[str]:
+    def _get_tokens(text: str) -> set[str]:
+        words = re.findall(r"[a-zA-Z0-9]+", text.lower())
+        stop_words = {
+            "the", "a", "an", "and", "or", "in", "on", "at", "to", "for", "of", "with", "by",
+            "ft", "feat", "song", "video", "official", "4k", "8k", "hd", "1080p", "720p",
+            "lyrics", "lyric", "audio", "full", "visualizer", "edit", "amv", "remix", "version",
+            "records", "music"
+        }
+        return {w for w in words if w not in stop_words and len(w) > 1}
+
+    @classmethod
+    def _score_match(cls, yt_title: str, item: dict[str, Any]) -> float:
+        """
+        Calculate matching confidence score between a YouTube title and a JioSaavn song.
+        Returns float between 0.0 and 2.0.
+        """
+        yt_tokens = cls._get_tokens(yt_title)
+        if not yt_tokens:
+            return 0.0
+
+        song_title = item.get("song", "") or item.get("title", "")
+        song_tokens = cls._get_tokens(song_title)
+        if not song_tokens:
+            return 0.0
+
+        # Title token match ratio
+        matched_title = yt_tokens.intersection(song_tokens)
+        title_ratio = len(matched_title) / len(song_tokens)
+
+        # Single word titles need higher verification (e.g. "Revenge")
+        if len(song_tokens) == 1:
+            title_ratio = 0.50 if title_ratio == 1.0 else 0.0
+
+        # Artist match bonus
+        artist_text = f"{item.get('singers', '')} {item.get('primary_artists', '')} {item.get('artist', '')}"
+        artist_tokens = cls._get_tokens(artist_text)
+        artist_match_count = len(yt_tokens.intersection(artist_tokens))
+        artist_bonus = min(0.40, artist_match_count * 0.20)
+
+        # Album match bonus
+        album_text = item.get("album", "")
+        album_tokens = cls._get_tokens(album_text)
+        album_match_count = len(yt_tokens.intersection(album_tokens))
+        album_bonus = min(0.20, album_match_count * 0.10)
+
+        return title_ratio + artist_bonus + album_bonus
+
+    @classmethod
+    def _generate_search_candidates(cls, raw_title: str) -> list[str]:
         """
         Generate cleaned, progressive search candidates from raw titles (e.g. YouTube oEmbed titles).
         Strips video tags, parentheticals, feat/ft tokens, emojis, and noisy channel labels.
@@ -155,37 +203,46 @@ class JioSaavnProvider(MusicProvider):
             if clean and len(clean) >= 2 and clean not in candidates:
                 candidates.append(clean)
 
-        # 1. Raw title
-        add_candidate(raw_title)
-
-        # 2. Split on major title delimiters like | or // or ::
-        pipe_cut = re.split(r"\||//|::", raw_title)[0].strip()
-        add_candidate(pipe_cut)
-
-        # 3. Strip non-ASCII / emojis
-        ascii_clean = re.sub(r"[^\x00-\x7F]+", " ", pipe_cut).strip()
-        add_candidate(ascii_clean)
-
-        # 4. Strip bracketed / parenthetical noise: (Official Video), [4K], (Lyrics), etc.
-        no_brackets = re.sub(r"[\(\[\{][^\)\]\}]*[\)\]\}]", " ", ascii_clean).strip()
-        add_candidate(no_brackets)
-
-        # 5. Strip common video/audio noise phrases
         noise_pattern = (
-            r"(?i)\b(official music video|official video|music video|official audio|"
-            r"lyric video|lyrics|video|audio|full song|audio song|visualizer|"
-            r"tiktok version|tiktok remix|edit audio|edit|amv)\b"
+            r"(?i)\b(4k|8k|hd|1080p|720p|official music video|official video|full video song|"
+            r"full video|video song|music video|official audio|lyric video|lyrics video|"
+            r"lyrics|audio song|full song|visualizer|tiktok version|tiktok remix|edit audio|"
+            r"edit|amv|video|audio|song)\b"
         )
-        no_noise = re.sub(noise_pattern, " ", no_brackets).strip()
-        add_candidate(no_noise)
 
-        # 6. Cut off ft. / feat.
-        no_ft = re.sub(r"(?i)\b(ft\.?|feat\.?).*$", "", no_noise).strip()
+        # 1. Clean bracketed annotations and noise from raw title
+        no_brackets = re.sub(r"[\(\[\{][^\)\]\}]*[\)\]\}]", " ", raw_title)
+        clean_raw = re.sub(noise_pattern, " ", no_brackets)
+        clean_raw = re.sub(r"[^\x00-\x7F]+", " ", clean_raw)
+
+        # 2. Extract delimited components (often: [Song Name] | [Album/Movie] | [Artists])
+        raw_parts = re.split(r"\||//|::", raw_title)
+        clean_parts: list[str] = []
+        for p in raw_parts:
+            cp = re.sub(r"[\(\[\{][^\)\]\}]*[\)\]\}]", " ", p)
+            cp = re.sub(noise_pattern, " ", cp)
+            cp = re.sub(r"[^\x00-\x7F]+", " ", cp).strip(" -|:")
+            if len(cp) >= 2:
+                clean_parts.append(cp)
+
+        if len(clean_parts) >= 2:
+            # Combine Song Name + Movie/Album: e.g. "Aaja Mahi Singh Is Bliing"
+            add_candidate(f"{clean_parts[0]} {clean_parts[1]}")
+            # Just Song Name: e.g. "Aaja Mahi"
+            add_candidate(clean_parts[0])
+            # If 3 or more parts, try Song Name + Artist: e.g. "Aaja Mahi Arijit Singh"
+            for extra in clean_parts[2:]:
+                add_candidate(f"{clean_parts[0]} {extra}")
+
+        # 3. Clean raw cut before ft./feat.
+        no_ft = re.sub(r"(?i)\b(ft\.?|feat\.?).*$", "", clean_raw).strip(" -|:")
         add_candidate(no_ft)
 
-        # 7. Replace ft./feat. with space (preserves artist name without choking token)
-        ft_as_space = re.sub(r"(?i)\b(ft\.?|feat\.?)\b", " ", no_noise).strip()
-        add_candidate(ft_as_space)
+        # 4. Clean raw without noise
+        add_candidate(clean_raw)
+
+        # 5. Fallback: original raw title
+        add_candidate(raw_title)
 
         return candidates
 
@@ -226,23 +283,53 @@ class JioSaavnProvider(MusicProvider):
                         yt_data = yt_resp.json()
                         yt_title = yt_data.get("title", "").strip()
                         if yt_title:
-                            # Search JioSaavn with progressive cleaned candidates
+                            best_match = None
+                            best_score = 0.0
+
                             for candidate in self._generate_search_candidates(yt_title):
                                 search_results = await self.search(candidate, limit=5)
-                                if search_results:
-                                    matched = search_results[0]
-                                    matched["track_id"] = track_id
-                                    matched["provider_song_id"] = clean_id
-                                    return matched
+                                for item in search_results:
+                                    score = self._score_match(yt_title, item)
+                                    if score > best_score:
+                                        best_score = score
+                                        best_match = item
+                                if best_score >= 1.0:
+                                    break
+
+                            # Verify confidence threshold (>= 0.70)
+                            # Prevents returning random wrong tracks (e.g. devotional song for Bollywood)
+                            if best_match and best_score >= 0.70:
+                                best_match["track_id"] = track_id
+                                best_match["provider_song_id"] = clean_id
+                                logger.info(
+                                    "Matched YouTube ID %s ('%s') with JioSaavn '%s' (score=%.2f)",
+                                    clean_id, yt_title, best_match.get("title"), best_score
+                                )
+                                return best_match
+                            else:
+                                logger.warning(
+                                    "No confident match for YouTube ID %s ('%s', best_score=%.2f). Rejecting fuzzy match to avoid wrong song.",
+                                    clean_id, yt_title, best_score
+                                )
+                                return None
 
                 # 3. Fallback: try searching JioSaavn with track_id string if non-numeric
                 if len(song_id) > 2 and not song_id.isdigit():
+                    best_match = None
+                    best_score = 0.0
                     for candidate in self._generate_search_candidates(song_id):
                         search_results = await self.search(candidate, limit=3)
-                        if search_results:
-                            matched = search_results[0]
-                            matched["track_id"] = track_id
-                            return matched
+                        for item in search_results:
+                            score = self._score_match(song_id, item)
+                            if score > best_score:
+                                best_score = score
+                                best_match = item
+                        if best_score >= 1.0:
+                            break
+
+                    if best_match and best_score >= 0.70:
+                        best_match["track_id"] = track_id
+                        return best_match
 
         except Exception as e:
             logger.error("Error fetching JioSaavn track %s: %s", track_id, e)

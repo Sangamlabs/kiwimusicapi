@@ -1,4 +1,5 @@
 from collections.abc import AsyncGenerator
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -44,4 +45,12 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Purge legacy mis-mapped tracks from early fuzzy matching cache
+        await conn.execute(
+            text(
+                "DELETE FROM tracks WHERE track_id IN ("
+                "'ZWCWfO0y26c', 'mbSp4gsKaU0', 'STLIkd7lgsw', '_dAkj5dxmEM'"
+                ")"
+            )
+        )
 
