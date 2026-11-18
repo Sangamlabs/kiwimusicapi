@@ -1,0 +1,8 @@
+[build]
+builder = "NIXPACKS"
+buildCommand = "cd tg-generator-bot && pip install --upgrade pip && pip install -r requirements.txt"
+
+[deploy]
+startCommand = "cd tg-generator-bot && python bot.py"
+restartPolicyType = "ALWAYS"
+restartPolicyMaxRetries = 10
