@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 set -e
 
 echo "[STARTUP] Starting Kiwi Music API Hybrid Architecture..."
@@ -25,10 +25,13 @@ cleanup() {
     if [ -n "$RUST_PID" ]; then
         kill -TERM "$RUST_PID" 2>/dev/null || true
     fi
+    if [ -n "$UVICORN_PID" ]; then
+        kill -TERM "$UVICORN_PID" 2>/dev/null || true
+    fi
     exit 0
 }
 
-trap cleanup SIGTERM SIGINT
+trap cleanup TERM INT
 
 # 3. Start Python FastAPI via Uvicorn in foreground
 WEB_PORT="${PORT:-8000}"
