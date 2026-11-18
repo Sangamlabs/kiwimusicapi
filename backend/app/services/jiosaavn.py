@@ -142,11 +142,17 @@ class JioSaavnProvider(MusicProvider):
         return []
 
     async def get_track(self, track_id: str) -> dict[str, Any] | None:
-        """Fetch song details by ID."""
-        song_id = track_id.replace("kiwi_saavn_", "")
+        """
+        Fetch song details by ID.
+        Supports:
+          1. JioSaavn song ID / kiwi_saavn_<id>
+          2. YouTube Video ID (e.g. 11 characters like _UY8JhRlcgE) via oEmbed -> JioSaavn match
+          3. Title fallback search
+        """
+        song_id = track_id.replace("kiwi_saavn_", "").strip()
         try:
             async with httpx.AsyncClient(timeout=self.timeout, headers=self.headers) as client:
-                # Direct song details call
+                # 1. Direct song details call on JioSaavn
                 params = {
                     "__call": "song.getDetails",
                     "cc": "in",
@@ -159,7 +165,40 @@ class JioSaavnProvider(MusicProvider):
                     data = resp.json()
                     item = data.get(song_id) or (data.get("songs") and data["songs"][0])
                     if item:
-                        return self._normalize_item(item)
+                        normalized = self._normalize_item(item)
+                        normalized["track_id"] = track_id
+                        return normalized
+
+                # 2. Check if track_id is a YouTube ID (11 chars, or starts with yt_)
+                clean_id = song_id.replace("yt_", "").replace("youtube_", "")
+                if len(clean_id) == 11 or "youtu" in clean_id:
+                    oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={clean_id}&format=json"
+                    yt_resp = await client.get(oembed_url)
+                    if yt_resp.status_code == 200:
+                        yt_data = yt_resp.json()
+                        yt_title = yt_data.get("title", "").strip()
+                        if yt_title:
+                            # Search JioSaavn with the YouTube video title
+                            search_results = await self.search(yt_title, limit=5)
+                            if not search_results:
+                                base_title = yt_title.split("(")[0].split("[")[0].strip()
+                                if base_title and base_title != yt_title:
+                                    search_results = await self.search(base_title, limit=5)
+
+                            if search_results:
+                                matched = search_results[0]
+                                matched["track_id"] = track_id
+                                matched["provider_song_id"] = clean_id
+                                return matched
+
+                # 3. Fallback: try searching JioSaavn with track_id string if non-numeric
+                if len(song_id) > 2 and not song_id.isdigit():
+                    search_results = await self.search(song_id, limit=3)
+                    if search_results:
+                        matched = search_results[0]
+                        matched["track_id"] = track_id
+                        return matched
+
         except Exception as e:
             logger.error("Error fetching JioSaavn track %s: %s", track_id, e)
 
