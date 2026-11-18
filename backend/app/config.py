@@ -49,6 +49,14 @@ class Settings(BaseSettings):
         default=200,
         description="Lifetime successful requests quota per API key"
     )
+    RUST_MEDIA_PORT: int = Field(
+        default=8088,
+        description="Internal port for Rust Axum streaming engine"
+    )
+    RUST_MEDIA_ENGINE_URL: str = Field(
+        default="http://127.0.0.1:8088",
+        description="Internal base URL for Rust Axum media engine"
+    )
 
     @field_validator("DATABASE_URL")
     @classmethod

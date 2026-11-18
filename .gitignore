@@ -40,3 +40,14 @@ htmlcov/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Rust build artifacts
+target/
+**/target/
+*.exe
+*.dll
+*.lib
+*.pdb
+*.def
+*.exp
+dlltool_shim.rs

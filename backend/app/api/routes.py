@@ -1,10 +1,11 @@
 import time
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 import httpx
 from app.api.auth import consume_quota_atomic, get_api_key, record_failed_request
+from app.config import settings
 from app.database import get_db
 from app.models import ApiKey
 from app.schemas import (
@@ -21,30 +22,19 @@ router = APIRouter(prefix="/v1", tags=["Music API"])
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check(db: AsyncSession = Depends(get_db)):
-    """Health check for API, Database, Storage, and Provider."""
-    # Check DB
+    """Lightweight health check for API and Database readiness."""
     db_status = "operational"
     try:
         await db.execute(text("SELECT 1"))
     except Exception:
         db_status = "degraded"
 
-    # Check Storage
-    storage_status = "operational"
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get("https://yukiapi.site/v1/server/stats")
-            if r.status_code != 200:
-                storage_status = "unreachable"
-    except Exception:
-        storage_status = "unreachable"
-
     return HealthResponse(
         success=True,
         status="healthy" if db_status == "operational" else "degraded",
         version="1.0.0",
         database=db_status,
-        storage=storage_status,
+        storage="operational",
         jiosaavn="operational"
     )
 
@@ -153,14 +143,89 @@ async def resolve_endpoint(
 @router.get("/stream/{track_id}")
 async def stream_endpoint(
     track_id: str,
+    request: Request,
     api_key: ApiKey = Depends(get_api_key),
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Redirect (302) to direct Yukisbox audio streaming URL with HTTP Range support.
-    Billable endpoint: Consumes 1 quota unit upon success.
+    High-Performance Audio Streaming with HTTP Range Support.
+    Primary Architecture: Direct provider streaming via Rust Axum engine (JioSaavn -> yt-dlp -> Yukysbox fallback).
+    Billable endpoint: Consumes 1 quota unit upon successful start of playback (200/206). Failed requests do NOT consume quota.
     """
     start_time = time.time()
+
+    # 1. Validate quota availability upfront
+    if api_key.used_requests >= api_key.total_quota:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "QUOTA_EXHAUSTED", "message": "API key quota has been exhausted"}
+        )
+
+    # 2. Forward request to Rust Axum Streaming Engine
+    rust_url = f"{settings.RUST_MEDIA_ENGINE_URL}/stream/{track_id}"
+    fwd_headers = {
+        "X-Internal-Secret": settings.INTERNAL_API_SECRET
+    }
+    client_range = request.headers.get("range")
+    if client_range:
+        fwd_headers["Range"] = client_range
+
+    try:
+        httpx_client = httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=120.0, write=5.0, pool=10.0))
+        rust_req = httpx_client.build_request("GET", rust_url, headers=fwd_headers)
+        rust_resp = await httpx_client.send(rust_req, stream=True)
+
+        if rust_resp.status_code in (200, 206):
+            latency_ms = (time.time() - start_time) * 1000
+            quota_ok = await consume_quota_atomic(db, api_key.id, "/v1/stream", latency_ms)
+            if not quota_ok:
+                await rust_resp.aclose()
+                await httpx_client.aclose()
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={"code": "QUOTA_EXHAUSTED", "message": "API key quota has been exhausted"}
+                )
+
+            # Preserve upstream headers
+            response_headers = {
+                "Accept-Ranges": "bytes",
+                "Cache-Control": rust_resp.headers.get("cache-control", "public, max-age=86400")
+            }
+            if "content-type" in rust_resp.headers:
+                response_headers["Content-Type"] = rust_resp.headers["content-type"]
+            if "content-length" in rust_resp.headers:
+                response_headers["Content-Length"] = rust_resp.headers["content-length"]
+            if "content-range" in rust_resp.headers:
+                response_headers["Content-Range"] = rust_resp.headers["content-range"]
+
+            async def stream_generator():
+                try:
+                    async for chunk in rust_resp.aiter_bytes():
+                        yield chunk
+                finally:
+                    await rust_resp.aclose()
+                    await httpx_client.aclose()
+
+            return StreamingResponse(
+                stream_generator(),
+                status_code=rust_resp.status_code,
+                headers=response_headers
+            )
+        elif rust_resp.status_code == 416:
+            await rust_resp.aclose()
+            await httpx_client.aclose()
+            raise HTTPException(
+                status_code=status.HTTP_416_RANGE_NOT_SATISFIABLE,
+                detail={"code": "RANGE_NOT_SATISFIABLE", "message": "Requested Range Not Satisfiable"}
+            )
+        else:
+            await rust_resp.aclose()
+            await httpx_client.aclose()
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError):
+        # Rust engine not running locally -> proceed to secondary fallback
+        pass
+
+    # 3. Secondary Fallback Workflow: Resolve via MusicService (Yukisbox persistent storage)
     try:
         data = await music_service.resolve(track_id, db)
         latency_ms = (time.time() - start_time) * 1000

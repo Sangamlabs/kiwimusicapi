@@ -1,0 +1,28 @@
+name: Kiwi Music API Keep-Alive Monitor
+
+on:
+  schedule:
+    # Run every 5 minutes (external keep-alive)
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping-health:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Kiwi Health Endpoint
+        env:
+          KIWI_HEALTH_URL: ${{ secrets.KIWI_HEALTH_URL }}
+        run: |
+          if [ -z "$KIWI_HEALTH_URL" ]; then
+            echo "Notice: KIWI_HEALTH_URL secret not set. Skipping keep-alive ping."
+            exit 0
+          fi
+          echo "Sending keep-alive probe to $KIWI_HEALTH_URL..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$KIWI_HEALTH_URL")
+          if [ "$STATUS" -eq 200 ]; then
+            echo "Health probe successful: HTTP $STATUS"
+          else
+            echo "Health probe alert: Received HTTP $STATUS"
+            exit 1
+          fi

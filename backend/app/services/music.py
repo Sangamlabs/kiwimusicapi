@@ -127,105 +127,204 @@ class MusicService:
                     "duration": track.duration
                 }
 
-            # 3. Obtain track metadata and source URL from provider
-            p_data = await self.provider.get_track(track_id)
-            if not p_data or not p_data.get("source_url"):
-                raise ValueError(f"Unable to find track or authorized audio source for {track_id}")
-
-            source_url = p_data["source_url"]
-            target_slug = sanitize_slug(f"{p_data['title']}_{p_data['artist']}_{p_data['provider_song_id']}")
-
-            # 4. Upload to Yukisbox (Method A with Method B fallback)
-            storage_res = None
+            # Distributed single-flight coordination via upload_jobs
+            job = None
             try:
-                logger.info("Attempting Yukisbox Method A (Remote URL) for %s...", track_id)
-                storage_res = await self.storage.upload_url(source_url, custom_slug=target_slug)
+                job_res = await db.execute(select(UploadJob).where(UploadJob.track_id == track_id))
+                job = job_res.scalar_one_or_none()
+                now = datetime.utcnow()
+                if job:
+                    if job.status == "PROCESSING" and job.locked_at:
+                        age = (now - job.locked_at).total_seconds()
+                        if age < 60:
+                            for _ in range(10):
+                                await asyncio.sleep(0.5)
+                                res = await db.execute(select(Track).where(Track.track_id == track_id))
+                                track = res.scalar_one_or_none()
+                                if track and track.storage_url and track.status == "available":
+                                    cache.set(cache_key, track.storage_url, ttl=7200)
+                                    return {
+                                        "track_id": track.track_id,
+                                        "title": track.title,
+                                        "artist": track.artist,
+                                        "storage": track.storage_provider,
+                                        "storage_uid": track.storage_uid,
+                                        "music_url": track.storage_url,
+                                        "cached": True,
+                                        "duration": track.duration
+                                    }
+                    job.status = "PROCESSING"
+                    job.locked_at = now
+                    job.attempts += 1
+                else:
+                    job = UploadJob(
+                        track_id=track_id,
+                        status="PROCESSING",
+                        attempts=1,
+                        locked_at=now,
+                        created_at=now,
+                        updated_at=now
+                    )
+                    db.add(job)
+                await db.flush()
             except Exception as e:
-                logger.warning("Method A failed (%s). Attempting Method B (Streamed file upload)...", e)
+                logger.warning("UploadJob lease notice for %s: %s", track_id, e)
 
-            if not storage_res or not storage_res.get("success"):
-                # Method B Fallback
-                temp_file = os.path.join(
-                    settings.TEMP_DIR,
-                    f"temp_{track_id}_{secrets.token_hex(4)}.{p_data.get('audio_format', 'mp3')}"
-                )
+            # 2.5 Dispatch acquisition to Rust media engine if configured
+            if getattr(settings, "RUST_MEDIA_ENGINE_URL", None):
                 try:
-                    async with httpx.AsyncClient(timeout=60.0) as client:
-                        async with client.stream("GET", source_url) as resp:
-                            resp.raise_for_status()
-                            async with aiofiles.open(temp_file, "wb") as f:
-                                async for chunk in resp.aiter_bytes(chunk_size=65536):
-                                    await f.write(chunk)
+                    headers = {"X-Internal-Secret": getattr(settings, "INTERNAL_API_SECRET", "")}
+                    async with httpx.AsyncClient(timeout=40.0) as client:
+                        acquire_resp = await client.post(
+                            f"{settings.RUST_MEDIA_ENGINE_URL.rstrip('/')}/internal/acquire",
+                            json={"track_id": track_id, "query": None},
+                            headers=headers,
+                        )
+                        if acquire_resp.status_code == 200:
+                            data = acquire_resp.json()
+                            if data.get("success") and data.get("track"):
+                                t = data["track"]
+                                cache.set(cache_key, t["storage_url"], ttl=7200)
+                                if job:
+                                    job.status = "COMPLETED"
+                                    job.completed_at = datetime.utcnow()
+                                    job.locked_at = None
+                                    await db.commit()
+                                return {
+                                    "track_id": t["track_id"],
+                                    "title": t["title"],
+                                    "artist": t["artist"],
+                                    "storage": t.get("storage_provider", "yukisbox"),
+                                    "storage_uid": t.get("storage_uid", ""),
+                                    "music_url": t["storage_url"],
+                                    "cached": True,
+                                    "duration": t.get("duration", 0),
+                                }
+                except Exception as e:
+                    logger.info("Rust media engine acquisition unavailable (%s); proceeding with local acquisition", e)
 
-                    storage_res = await self.storage.upload_file(temp_file, custom_slug=target_slug)
-                finally:
-                    if os.path.exists(temp_file):
-                        try:
-                            os.remove(temp_file)
-                        except Exception:
-                            pass
+            try:
+                # 3. Obtain track metadata and source URL from provider
+                p_data = await self.provider.get_track(track_id)
+                if not p_data or not p_data.get("source_url"):
+                    raise ValueError(f"Unable to find track or authorized audio source for {track_id}")
 
-            if not storage_res or not storage_res.get("success"):
-                logger.warning(
-                    "Storage upload failed for track %s; falling back to direct provider stream",
-                    track_id
-                )
+                source_url = p_data["source_url"]
+                target_slug = sanitize_slug(f"{p_data['title']}_{p_data['artist']}_{p_data['provider_song_id']}")
+
+                # 4. Upload to Yukisbox (Method A with Method B fallback)
+                storage_res = None
+                try:
+                    logger.info("Attempting Yukisbox Method A (Remote URL) for %s...", track_id)
+                    storage_res = await self.storage.upload_url(source_url, custom_slug=target_slug)
+                except Exception as e:
+                    logger.warning("Method A failed (%s). Attempting Method B (Streamed file upload)...", e)
+
+                if not storage_res or not storage_res.get("success"):
+                    # Method B Fallback
+                    temp_file = os.path.join(
+                        settings.TEMP_DIR,
+                        f"temp_{track_id}_{secrets.token_hex(4)}.{p_data.get('audio_format', 'mp3')}"
+                    )
+                    try:
+                        async with httpx.AsyncClient(timeout=60.0) as client:
+                            async with client.stream("GET", source_url) as resp:
+                                resp.raise_for_status()
+                                async with aiofiles.open(temp_file, "wb") as f:
+                                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                                        await f.write(chunk)
+
+                        storage_res = await self.storage.upload_file(temp_file, custom_slug=target_slug)
+                    finally:
+                        if os.path.exists(temp_file):
+                            try:
+                                os.remove(temp_file)
+                            except Exception:
+                                pass
+
+                if not storage_res or not storage_res.get("success"):
+                    logger.warning(
+                        "Storage upload failed for track %s; falling back to direct provider stream",
+                        track_id
+                    )
+                    if job:
+                        job.status = "FAILED"
+                        job.last_error = "Storage upload failed"
+                        job.locked_at = None
+                        await db.commit()
+                    return {
+                        "track_id": track_id,
+                        "title": p_data.get("title", "Unknown Title"),
+                        "artist": p_data.get("artist", "Unknown Artist"),
+                        "storage": "jiosaavn_direct",
+                        "storage_uid": p_data.get("provider_song_id", track_id),
+                        "music_url": source_url,
+                        "cached": False,
+                        "duration": p_data.get("duration", 0)
+                    }
+
+                # 5. Persist to PostgreSQL
+                if not track:
+                    track = Track(
+                        track_id=track_id,
+                        provider=p_data.get("provider", "jiosaavn"),
+                        provider_song_id=p_data.get("provider_song_id", track_id),
+                        title=p_data.get("title", "Unknown Title"),
+                        artist=p_data.get("artist", "Unknown Artist"),
+                        album=p_data.get("album"),
+                        duration=p_data.get("duration", 0),
+                        language=p_data.get("language"),
+                        thumbnail=p_data.get("thumbnail"),
+                        source_url=source_url,
+                        storage_provider="yukisbox",
+                        storage_uid=storage_res["uid"],
+                        storage_url=storage_res["url"],
+                        file_size=storage_res.get("file_size"),
+                        audio_format=p_data.get("audio_format", "mp3"),
+                        status="available",
+                        created_at=datetime.utcnow(),
+                        updated_at=datetime.utcnow(),
+                        last_accessed_at=datetime.utcnow()
+                    )
+                    db.add(track)
+                else:
+                    track.storage_uid = storage_res["uid"]
+                    track.storage_url = storage_res["url"]
+                    track.status = "available"
+                    track.file_size = storage_res.get("file_size")
+                    track.updated_at = datetime.utcnow()
+                    track.last_accessed_at = datetime.utcnow()
+
+                if job:
+                    job.status = "COMPLETED"
+                    job.locked_at = None
+                    job.completed_at = datetime.utcnow()
+                    job.updated_at = datetime.utcnow()
+
+                await db.commit()
+                cache.set(cache_key, track.storage_url, ttl=7200)
+
                 return {
-                    "track_id": track_id,
-                    "title": p_data.get("title", "Unknown Title"),
-                    "artist": p_data.get("artist", "Unknown Artist"),
-                    "storage": "jiosaavn_direct",
-                    "storage_uid": p_data.get("provider_song_id", track_id),
-                    "music_url": source_url,
+                    "track_id": track.track_id,
+                    "title": track.title,
+                    "artist": track.artist,
+                    "storage": track.storage_provider,
+                    "storage_uid": track.storage_uid,
+                    "music_url": track.storage_url,
                     "cached": False,
-                    "duration": p_data.get("duration", 0)
+                    "duration": track.duration
                 }
-
-            # 5. Persist to PostgreSQL
-            if not track:
-                track = Track(
-                    track_id=track_id,
-                    provider=p_data.get("provider", "jiosaavn"),
-                    provider_song_id=p_data.get("provider_song_id", track_id),
-                    title=p_data.get("title", "Unknown Title"),
-                    artist=p_data.get("artist", "Unknown Artist"),
-                    album=p_data.get("album"),
-                    duration=p_data.get("duration", 0),
-                    language=p_data.get("language"),
-                    thumbnail=p_data.get("thumbnail"),
-                    source_url=source_url,
-                    storage_provider="yukisbox",
-                    storage_uid=storage_res["uid"],
-                    storage_url=storage_res["url"],
-                    file_size=storage_res.get("file_size"),
-                    audio_format=p_data.get("audio_format", "mp3"),
-                    status="available",
-                    created_at=datetime.utcnow(),
-                    updated_at=datetime.utcnow(),
-                    last_accessed_at=datetime.utcnow()
-                )
-                db.add(track)
-            else:
-                track.storage_uid = storage_res["uid"]
-                track.storage_url = storage_res["url"]
-                track.status = "available"
-                track.file_size = storage_res.get("file_size")
-                track.updated_at = datetime.utcnow()
-                track.last_accessed_at = datetime.utcnow()
-
-            await db.commit()
-            cache.set(cache_key, track.storage_url, ttl=7200)
-
-            return {
-                "track_id": track.track_id,
-                "title": track.title,
-                "artist": track.artist,
-                "storage": track.storage_provider,
-                "storage_uid": track.storage_uid,
-                "music_url": track.storage_url,
-                "cached": False,
-                "duration": track.duration
-            }
+            except Exception as e:
+                if job:
+                    try:
+                        job.status = "FAILED"
+                        job.last_error = str(e)
+                        job.locked_at = None
+                        job.updated_at = datetime.utcnow()
+                        await db.commit()
+                    except Exception:
+                        pass
+                raise e
 
 music_service = MusicService()
 

@@ -1,0 +1,342 @@
+use axum::{
+    body::Body,
+    extract::{Path, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Json, Response},
+};
+use futures_util::TryStreamExt;
+use serde_json::json;
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{error, info, warn};
+
+use crate::acquisition::AcquisitionCoordinator;
+use crate::providers::ProviderManager;
+use crate::security::validate_url_ssrf;
+use crate::storage::YukisboxStorage;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub provider_manager: Arc<ProviderManager>,
+    pub storage: Arc<YukisboxStorage>,
+    pub coordinator: Arc<AcquisitionCoordinator>,
+    pub http_client: reqwest::Client,
+}
+
+impl AppState {
+    pub fn new(
+        provider_manager: Arc<ProviderManager>,
+        storage: Arc<YukisboxStorage>,
+        coordinator: Arc<AcquisitionCoordinator>,
+    ) -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(10)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        Self {
+            provider_manager,
+            storage,
+            coordinator,
+            http_client,
+        }
+    }
+}
+
+pub async fn health_handler() -> impl IntoResponse {
+    Json(json!({
+        "status": "healthy",
+        "service": "kiwi-rust-streamer",
+        "version": "0.1.0"
+    }))
+}
+
+/// Primary Playback Handler:
+/// Direct Provider Streaming (JioSaavn -> yt-dlp) with HTTP Range support and Yukysbox Storage fallback.
+pub async fn stream_handler(
+    State(state): State<AppState>,
+    Path(track_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let clean_track_id = track_id.trim();
+    let range_header = headers.get(header::RANGE).cloned();
+
+    // 1. Primary Direct Provider: JioSaavn
+    info!(
+        "Stream: Attempting primary direct stream via JioSaavn for '{}'...",
+        clean_track_id
+    );
+    match state
+        .provider_manager
+        .jiosaavn()
+        .get_track(clean_track_id)
+        .await
+    {
+        Ok(Some(meta)) => {
+            if let Ok(safe_url) = validate_url_ssrf(&meta.source_url) {
+                match proxy_upstream_stream(
+                    &state.http_client,
+                    safe_url.as_str(),
+                    range_header.as_ref(),
+                    &meta.audio_format,
+                )
+                .await
+                {
+                    Ok(resp) => {
+                        info!(
+                            "Stream: Direct JioSaavn stream established for '{}'",
+                            clean_track_id
+                        );
+                        return resp;
+                    }
+                    Err(e) => {
+                        warn!("Stream: JioSaavn upstream failed before first byte ({}). Falling back to yt-dlp.", e);
+                    }
+                }
+            } else {
+                warn!(
+                    "Stream: JioSaavn source URL rejected by SSRF guard for '{}'",
+                    clean_track_id
+                );
+            }
+        }
+        Ok(None) => {
+            info!(
+                "Stream: Track '{}' not found on JioSaavn. Falling back to yt-dlp.",
+                clean_track_id
+            );
+        }
+        Err(e) => {
+            warn!(
+                "Stream: JioSaavn resolution error for '{}': {}. Falling back to yt-dlp.",
+                clean_track_id, e
+            );
+        }
+    }
+
+    // 2. Secondary Direct Provider: Managed yt-dlp
+    info!(
+        "Stream: Attempting secondary direct stream via yt-dlp for '{}'...",
+        clean_track_id
+    );
+    match state
+        .provider_manager
+        .ytdlp()
+        .extract_info(clean_track_id)
+        .await
+    {
+        Ok(Some(meta)) => {
+            if let Ok(safe_url) = validate_url_ssrf(&meta.source_url) {
+                match proxy_upstream_stream(
+                    &state.http_client,
+                    safe_url.as_str(),
+                    range_header.as_ref(),
+                    &meta.audio_format,
+                )
+                .await
+                {
+                    Ok(resp) => {
+                        info!(
+                            "Stream: Direct yt-dlp stream established for '{}'",
+                            clean_track_id
+                        );
+                        return resp;
+                    }
+                    Err(e) => {
+                        warn!("Stream: yt-dlp upstream failed before first byte ({}). Falling back to Yukysbox.", e);
+                    }
+                }
+            } else {
+                warn!(
+                    "Stream: yt-dlp source URL rejected by SSRF guard for '{}'",
+                    clean_track_id
+                );
+            }
+        }
+        Ok(None) => {
+            info!(
+                "Stream: Track '{}' not resolved by yt-dlp. Falling back to Yukysbox.",
+                clean_track_id
+            );
+        }
+        Err(e) => {
+            warn!(
+                "Stream: yt-dlp resolution error for '{}': {}. Falling back to Yukysbox.",
+                clean_track_id, e
+            );
+        }
+    }
+
+    // 3. Fallback Storage Workflow: Yukysbox Persistent Cache/Acquisition
+    info!(
+        "Stream: All direct providers failed. Invoking Yukysbox fallback for '{}'...",
+        clean_track_id
+    );
+    match state.coordinator.acquire(clean_track_id, None).await {
+        Ok(acquired) => {
+            if let Ok(safe_url) = validate_url_ssrf(&acquired.storage_url) {
+                match proxy_upstream_stream(
+                    &state.http_client,
+                    safe_url.as_str(),
+                    range_header.as_ref(),
+                    &acquired.audio_format,
+                )
+                .await
+                {
+                    Ok(resp) => {
+                        info!(
+                            "Stream: Yukysbox storage stream established for '{}'",
+                            clean_track_id
+                        );
+                        return resp;
+                    }
+                    Err(e) => {
+                        error!(
+                            "Stream: Yukysbox storage streaming failed for '{}': {}",
+                            clean_track_id, e
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            error!(
+                "Stream: Yukysbox acquisition fallback failed for '{}': {}",
+                clean_track_id, e
+            );
+        }
+    }
+
+    // 4. All providers and storage fallback failed
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "success": false,
+            "error": {
+                "code": "TRACK_NOT_FOUND",
+                "message": format!("Unable to stream track '{}' across all eligible providers and storage", clean_track_id)
+            }
+        })),
+    ).into_response()
+}
+
+/// Internal Acquire Handler for Python FastAPI
+pub async fn internal_acquire_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let track_id = payload
+        .get("track_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let query = payload.get("query").and_then(|v| v.as_str());
+
+    if track_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": "Missing track_id"
+            })),
+        )
+            .into_response();
+    }
+
+    match state.coordinator.acquire(track_id, query).await {
+        Ok(acquired) => (
+            StatusCode::OK,
+            Json(json!({ "success": true, "track": acquired })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Helper: Proxies an upstream audio URL with Range headers, backpressure, and client disconnect cancellation.
+async fn proxy_upstream_stream(
+    client: &reqwest::Client,
+    upstream_url: &str,
+    range_header: Option<&HeaderValue>,
+    audio_format: &str,
+) -> Result<Response, String> {
+    let mut req = client.get(upstream_url);
+
+    // Propagate Range header if provided by client
+    if let Some(range) = range_header {
+        req = req.header(reqwest::header::RANGE, range.clone());
+    }
+
+    // Send upstream request (aborts early on timeout before reading first byte)
+    let upstream_resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Upstream connection error: {}", e))?;
+
+    let upstream_status = upstream_resp.status();
+
+    // Verify upstream returned a streamable status (200 OK or 206 Partial Content or 416 Range Unsatisfiable)
+    if !upstream_status.is_success()
+        && upstream_status != reqwest::StatusCode::PARTIAL_CONTENT
+        && upstream_status != reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+    {
+        return Err(format!(
+            "Upstream returned non-streamable status: {}",
+            upstream_status
+        ));
+    }
+
+    let status_code = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::OK);
+
+    // Extract and preserve upstream headers
+    let content_type = upstream_resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| match audio_format {
+            "m4a" | "mp4" => "audio/mp4".to_string(),
+            _ => "audio/mpeg".to_string(),
+        });
+
+    let content_length = upstream_resp
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let content_range = upstream_resp
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Stream chunks directly from upstream to downstream with backpressure and cancellation
+    let byte_stream = upstream_resp.bytes_stream().map_err(std::io::Error::other);
+
+    let body = Body::from_stream(byte_stream);
+
+    let mut response_builder = Response::builder()
+        .status(status_code)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "public, max-age=86400");
+
+    if let Some(cl) = content_length {
+        response_builder = response_builder.header(header::CONTENT_LENGTH, cl);
+    }
+
+    if let Some(cr) = content_range {
+        response_builder = response_builder.header(header::CONTENT_RANGE, cr);
+    }
+
+    response_builder
+        .body(body)
+        .map_err(|e| format!("Failed to build streaming response: {}", e))
+}

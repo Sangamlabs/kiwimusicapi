@@ -6,12 +6,12 @@ services:
     plan: free
     region: oregon
     healthCheckPath: /v1/health
-    autoDeploy: true
+    autoDeploy: false
     envVars:
       - key: DATABASE_URL
         sync: false
       - key: INTERNAL_API_SECRET
-        sync: false
+        generateValue: true
       - key: SECRET_KEY
         generateValue: true
       - key: YUKISBOX_BASE_URL
@@ -20,7 +20,15 @@ services:
         value: https://saavn.dev
       - key: YUKISBOX_TIMEOUT
         value: "300"
+      - key: RUST_MEDIA_PORT
+        value: "8088"
+      - key: RUST_MEDIA_ENGINE_URL
+        value: "http://127.0.0.1:8088"
       - key: MAX_UPLOAD_CONCURRENCY
         value: "3"
       - key: MAX_DOWNLOAD_SIZE_MB
         value: "100"
+      - key: YTDLP_ENABLED
+        value: "true"
+      - key: YTDLP_TIMEOUT
+        value: "120"
