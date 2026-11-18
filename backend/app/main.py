@@ -57,7 +57,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
 app.include_router(public_router)
 app.include_router(internal_router)
 
-@app.get("/", include_in_schema=False)
+@app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
 async def root():
     return {
         "service": "Kiwi Music API",

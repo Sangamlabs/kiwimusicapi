@@ -166,7 +166,20 @@ class MusicService:
                             pass
 
             if not storage_res or not storage_res.get("success"):
-                raise RuntimeError(f"Storage upload failed for track {track_id}")
+                logger.warning(
+                    "Storage upload failed for track %s; falling back to direct provider stream",
+                    track_id
+                )
+                return {
+                    "track_id": track_id,
+                    "title": p_data.get("title", "Unknown Title"),
+                    "artist": p_data.get("artist", "Unknown Artist"),
+                    "storage": "jiosaavn_direct",
+                    "storage_uid": p_data.get("provider_song_id", track_id),
+                    "music_url": source_url,
+                    "cached": False,
+                    "duration": p_data.get("duration", 0)
+                }
 
             # 5. Persist to PostgreSQL
             if not track:

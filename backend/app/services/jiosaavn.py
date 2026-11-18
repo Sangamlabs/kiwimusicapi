@@ -2,6 +2,7 @@ import asyncio
 import base64
 import html
 import logging
+import re
 from typing import Any
 from Crypto.Cipher import DES
 import httpx
@@ -141,6 +142,53 @@ class JioSaavnProvider(MusicProvider):
 
         return []
 
+    @staticmethod
+    def _generate_search_candidates(raw_title: str) -> list[str]:
+        """
+        Generate cleaned, progressive search candidates from raw titles (e.g. YouTube oEmbed titles).
+        Strips video tags, parentheticals, feat/ft tokens, emojis, and noisy channel labels.
+        """
+        candidates: list[str] = []
+
+        def add_candidate(c: str):
+            clean = re.sub(r"\s+", " ", c).strip(" -|:_#~!/\\")
+            if clean and len(clean) >= 2 and clean not in candidates:
+                candidates.append(clean)
+
+        # 1. Raw title
+        add_candidate(raw_title)
+
+        # 2. Split on major title delimiters like | or // or ::
+        pipe_cut = re.split(r"\||//|::", raw_title)[0].strip()
+        add_candidate(pipe_cut)
+
+        # 3. Strip non-ASCII / emojis
+        ascii_clean = re.sub(r"[^\x00-\x7F]+", " ", pipe_cut).strip()
+        add_candidate(ascii_clean)
+
+        # 4. Strip bracketed / parenthetical noise: (Official Video), [4K], (Lyrics), etc.
+        no_brackets = re.sub(r"[\(\[\{][^\)\]\}]*[\)\]\}]", " ", ascii_clean).strip()
+        add_candidate(no_brackets)
+
+        # 5. Strip common video/audio noise phrases
+        noise_pattern = (
+            r"(?i)\b(official music video|official video|music video|official audio|"
+            r"lyric video|lyrics|video|audio|full song|audio song|visualizer|"
+            r"tiktok version|tiktok remix|edit audio|edit|amv)\b"
+        )
+        no_noise = re.sub(noise_pattern, " ", no_brackets).strip()
+        add_candidate(no_noise)
+
+        # 6. Cut off ft. / feat.
+        no_ft = re.sub(r"(?i)\b(ft\.?|feat\.?).*$", "", no_noise).strip()
+        add_candidate(no_ft)
+
+        # 7. Replace ft./feat. with space (preserves artist name without choking token)
+        ft_as_space = re.sub(r"(?i)\b(ft\.?|feat\.?)\b", " ", no_noise).strip()
+        add_candidate(ft_as_space)
+
+        return candidates
+
     async def get_track(self, track_id: str) -> dict[str, Any] | None:
         """
         Fetch song details by ID.
@@ -178,26 +226,23 @@ class JioSaavnProvider(MusicProvider):
                         yt_data = yt_resp.json()
                         yt_title = yt_data.get("title", "").strip()
                         if yt_title:
-                            # Search JioSaavn with the YouTube video title
-                            search_results = await self.search(yt_title, limit=5)
-                            if not search_results:
-                                base_title = yt_title.split("(")[0].split("[")[0].strip()
-                                if base_title and base_title != yt_title:
-                                    search_results = await self.search(base_title, limit=5)
-
-                            if search_results:
-                                matched = search_results[0]
-                                matched["track_id"] = track_id
-                                matched["provider_song_id"] = clean_id
-                                return matched
+                            # Search JioSaavn with progressive cleaned candidates
+                            for candidate in self._generate_search_candidates(yt_title):
+                                search_results = await self.search(candidate, limit=5)
+                                if search_results:
+                                    matched = search_results[0]
+                                    matched["track_id"] = track_id
+                                    matched["provider_song_id"] = clean_id
+                                    return matched
 
                 # 3. Fallback: try searching JioSaavn with track_id string if non-numeric
                 if len(song_id) > 2 and not song_id.isdigit():
-                    search_results = await self.search(song_id, limit=3)
-                    if search_results:
-                        matched = search_results[0]
-                        matched["track_id"] = track_id
-                        return matched
+                    for candidate in self._generate_search_candidates(song_id):
+                        search_results = await self.search(candidate, limit=3)
+                        if search_results:
+                            matched = search_results[0]
+                            matched["track_id"] = track_id
+                            return matched
 
         except Exception as e:
             logger.error("Error fetching JioSaavn track %s: %s", track_id, e)

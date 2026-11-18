@@ -135,6 +135,13 @@ async def resolve_endpoint(
 
     except HTTPException:
         raise
+    except ValueError as e:
+        latency_ms = (time.time() - start_time) * 1000
+        await record_failed_request(db, api_key.id, "/v1/resolve", 404, latency_ms)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "TRACK_NOT_FOUND", "message": str(e)}
+        )
     except Exception as e:
         latency_ms = (time.time() - start_time) * 1000
         await record_failed_request(db, api_key.id, "/v1/resolve", 500, latency_ms)
@@ -169,6 +176,13 @@ async def stream_endpoint(
 
     except HTTPException:
         raise
+    except ValueError as e:
+        latency_ms = (time.time() - start_time) * 1000
+        await record_failed_request(db, api_key.id, "/v1/stream", 404, latency_ms)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "TRACK_NOT_FOUND", "message": str(e)}
+        )
     except Exception as e:
         latency_ms = (time.time() - start_time) * 1000
         await record_failed_request(db, api_key.id, "/v1/stream", 500, latency_ms)

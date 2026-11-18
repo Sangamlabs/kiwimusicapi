@@ -55,3 +55,13 @@ async def test_jiosaavn_get_track_mock():
         assert track["title"] == "Detailed Song"
         assert track["duration"] == 210
 
+def test_generate_search_candidates():
+    title = "Gal Sun - Sabaat Batin ft. Rackstar | Official Music Video | SkillMill Records"
+    candidates = JioSaavnProvider._generate_search_candidates(title)
+    assert len(candidates) >= 3
+    # Check that pipe suffix was removed
+    assert any("Official Music Video" not in c for c in candidates)
+    # Check that ft. was cleaned
+    assert any("Gal Sun - Sabaat Batin" in c for c in candidates)
+
+
