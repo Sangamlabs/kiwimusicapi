@@ -75,23 +75,13 @@ impl AcquisitionCoordinator {
         }
     }
 
-    /// Primary execution flow: Cache-first lookup -> Distributed single-flight lock -> Provider resolution -> Yukysbox upload -> Storage verification -> DB persistence
-    pub async fn acquire(
-        &self,
-        track_id: &str,
-        _query: Option<&str>,
-    ) -> Result<AcquiredTrack, AcquisitionError> {
+    /// High-speed check if track already exists in PostgreSQL verified storage cache (< 2ms)
+    pub async fn find_cached(&self, track_id: &str) -> Option<AcquiredTrack> {
         let clean_track_id = track_id.trim();
-
-        // 1. Check PostgreSQL for verified cached track (Step 3 in architecture)
         if let Some(ref db) = self.db {
             if let Ok(Some(cached_track)) = db.find_track(clean_track_id).await {
                 if let Some(storage_url) = cached_track.storage_url {
-                    info!(
-                        "Cache HIT for track_id: {} (returning existing reference)",
-                        clean_track_id
-                    );
-                    return Ok(AcquiredTrack {
+                    return Some(AcquiredTrack {
                         track_id: cached_track.track_id,
                         provider: cached_track.provider,
                         provider_song_id: cached_track.provider_song_id,
@@ -109,7 +99,28 @@ impl AcquisitionCoordinator {
                     });
                 }
             }
+        }
+        None
+    }
 
+    /// Primary execution flow: Cache-first lookup -> Distributed single-flight lock -> Provider resolution -> Yukysbox upload -> Storage verification -> DB persistence
+    pub async fn acquire(
+        &self,
+        track_id: &str,
+        _query: Option<&str>,
+    ) -> Result<AcquiredTrack, AcquisitionError> {
+        let clean_track_id = track_id.trim();
+
+        // 1. Check PostgreSQL for verified cached track (Step 3 in architecture)
+        if let Some(cached) = self.find_cached(clean_track_id).await {
+            info!(
+                "Cache HIT for track_id: {} (returning existing reference)",
+                clean_track_id
+            );
+            return Ok(cached);
+        }
+
+        if let Some(ref db) = self.db {
             // 2. Obtain distributed single-flight lease on upload_jobs (Step 6)
             let mut attempts = 0;
             let max_wait_attempts = 60; // 30 seconds total (60 * 500ms)

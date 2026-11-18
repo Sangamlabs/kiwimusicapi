@@ -1,6 +1,6 @@
 import time
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 import httpx
@@ -140,7 +140,7 @@ async def resolve_endpoint(
             detail={"code": "RESOLUTION_FAILED", "message": str(e)}
         )
 
-@router.get("/stream/{track_id}")
+@router.api_route("/stream/{track_id}", methods=["GET", "HEAD"])
 async def stream_endpoint(
     track_id: str,
     request: Request,
@@ -171,8 +171,11 @@ async def stream_endpoint(
         fwd_headers["Range"] = client_range
 
     try:
-        httpx_client = httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=120.0, write=5.0, pool=10.0))
-        rust_req = httpx_client.build_request("GET", rust_url, headers=fwd_headers)
+        httpx_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=3.0, read=180.0, write=5.0, pool=30.0),
+            limits=httpx.Limits(max_keepalive_connections=50, max_connections=200, keepalive_expiry=120.0),
+        )
+        rust_req = httpx_client.build_request(request.method, rust_url, headers=fwd_headers)
         rust_resp = await httpx_client.send(rust_req, stream=True)
 
         if rust_resp.status_code in (200, 206):
@@ -198,9 +201,23 @@ async def stream_endpoint(
             if "content-range" in rust_resp.headers:
                 response_headers["Content-Range"] = rust_resp.headers["content-range"]
 
+            if request.method == "HEAD":
+                await rust_resp.aclose()
+                await httpx_client.aclose()
+                return Response(
+                    content=b"",
+                    status_code=rust_resp.status_code,
+                    headers=response_headers
+                )
+
             async def stream_generator():
                 try:
-                    async for chunk in rust_resp.aiter_bytes():
+                    aiter = rust_resp.aiter_bytes
+                    try:
+                        stream = aiter(chunk_size=65536)
+                    except TypeError:
+                        stream = aiter()
+                    async for chunk in stream:
                         yield chunk
                 finally:
                     await rust_resp.aclose()

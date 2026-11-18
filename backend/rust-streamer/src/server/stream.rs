@@ -15,12 +15,20 @@ use crate::providers::ProviderManager;
 use crate::security::validate_url_ssrf;
 use crate::storage::YukisboxStorage;
 
+#[derive(Clone, Debug)]
+pub struct CachedStreamUrl {
+    pub url: String,
+    pub audio_format: String,
+    pub created_at: std::time::Instant,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub provider_manager: Arc<ProviderManager>,
     pub storage: Arc<YukisboxStorage>,
     pub coordinator: Arc<AcquisitionCoordinator>,
     pub http_client: reqwest::Client,
+    pub stream_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<String, CachedStreamUrl>>>,
 }
 
 impl AppState {
@@ -31,9 +39,10 @@ impl AppState {
     ) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
-            .connect_timeout(Duration::from_secs(10))
-            .pool_idle_timeout(Duration::from_secs(90))
-            .pool_max_idle_per_host(10)
+            .connect_timeout(Duration::from_secs(5))
+            .pool_idle_timeout(Duration::from_secs(120))
+            .pool_max_idle_per_host(30)
+            .tcp_nodelay(true)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -42,6 +51,7 @@ impl AppState {
             storage,
             coordinator,
             http_client,
+            stream_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -63,6 +73,66 @@ pub async fn stream_handler(
 ) -> Response {
     let clean_track_id = track_id.trim();
     let range_header = headers.get(header::RANGE).cloned();
+
+    // 0. High-speed In-Memory Stream Cache Check (< 1ms TTFB for subsequent Range requests / seeking)
+    {
+        let cache_read = state.stream_cache.read().await;
+        if let Some(entry) = cache_read.get(clean_track_id) {
+            if entry.created_at.elapsed() < Duration::from_secs(7200) {
+                if let Ok(safe_url) = validate_url_ssrf(&entry.url) {
+                    match proxy_upstream_stream(
+                        &state.http_client,
+                        safe_url.as_str(),
+                        range_header.as_ref(),
+                        &entry.audio_format,
+                    )
+                    .await
+                    {
+                        Ok(resp) => {
+                            info!("Stream: In-memory cache HIT for '{}' (sub-millisecond)", clean_track_id);
+                            return resp;
+                        }
+                        Err(e) => {
+                            warn!("Stream: Cached in-memory URL stream failed ({}). Refetching.", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 0.1 High-speed PostgreSQL verified storage cache check (< 2ms)
+    if let Some(cached) = state.coordinator.find_cached(clean_track_id).await {
+        if let Ok(safe_url) = validate_url_ssrf(&cached.storage_url) {
+            {
+                let mut cache_write = state.stream_cache.write().await;
+                cache_write.insert(
+                    clean_track_id.to_string(),
+                    CachedStreamUrl {
+                        url: cached.storage_url.clone(),
+                        audio_format: cached.audio_format.clone(),
+                        created_at: std::time::Instant::now(),
+                    },
+                );
+            }
+            match proxy_upstream_stream(
+                &state.http_client,
+                safe_url.as_str(),
+                range_header.as_ref(),
+                &cached.audio_format,
+            )
+            .await
+            {
+                Ok(resp) => {
+                    info!("Stream: Served from PostgreSQL storage cache for '{}'", clean_track_id);
+                    return resp;
+                }
+                Err(e) => {
+                    warn!("Stream: Database cached stream failed ({}). Falling back to direct providers.", e);
+                }
+            }
+        }
+    }
 
     // 1. Primary Direct Provider: JioSaavn
     info!(
@@ -90,6 +160,18 @@ pub async fn stream_handler(
                             "Stream: Direct JioSaavn stream established for '{}'",
                             clean_track_id
                         );
+                        // Cache resolved stream URL in memory for instant subsequent range requests
+                        {
+                            let mut cache_write = state.stream_cache.write().await;
+                            cache_write.insert(
+                                clean_track_id.to_string(),
+                                CachedStreamUrl {
+                                    url: safe_url.as_str().to_string(),
+                                    audio_format: meta.audio_format.clone(),
+                                    created_at: std::time::Instant::now(),
+                                },
+                            );
+                        }
                         return resp;
                     }
                     Err(e) => {
@@ -143,6 +225,18 @@ pub async fn stream_handler(
                             "Stream: Direct yt-dlp stream established for '{}'",
                             clean_track_id
                         );
+                        // Cache resolved stream URL in memory for instant subsequent range requests
+                        {
+                            let mut cache_write = state.stream_cache.write().await;
+                            cache_write.insert(
+                                clean_track_id.to_string(),
+                                CachedStreamUrl {
+                                    url: safe_url.as_str().to_string(),
+                                    audio_format: meta.audio_format.clone(),
+                                    created_at: std::time::Instant::now(),
+                                },
+                            );
+                        }
                         return resp;
                     }
                     Err(e) => {
@@ -191,6 +285,18 @@ pub async fn stream_handler(
                             "Stream: Yukysbox storage stream established for '{}'",
                             clean_track_id
                         );
+                        // Cache resolved stream URL in memory for instant subsequent range requests
+                        {
+                            let mut cache_write = state.stream_cache.write().await;
+                            cache_write.insert(
+                                clean_track_id.to_string(),
+                                CachedStreamUrl {
+                                    url: safe_url.as_str().to_string(),
+                                    audio_format: acquired.audio_format.clone(),
+                                    created_at: std::time::Instant::now(),
+                                },
+                            );
+                        }
                         return resp;
                     }
                     Err(e) => {
