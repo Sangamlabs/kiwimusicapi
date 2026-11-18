@@ -3,7 +3,7 @@
 # -------------------------------------------------------------
 # Stage 1: Build high-performance Rust streaming engine
 # -------------------------------------------------------------
-FROM rust:1.82-slim AS rust-builder
+FROM rust:1.85-slim AS rust-builder
 
 WORKDIR /usr/src/rust-streamer
 
