@@ -1,0 +1,42 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment Variables & Secrets (CRITICAL)
+.env
+.env.*
+*.env
+**/.env
+**/.env.*
+!**/.env.example
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Local test scratch & media
+test_tone.mp3
+poc_yukisbox.py
+temp/
+**/temp/
+.pytest_cache/
+**/.pytest_cache/
+.coverage
+htmlcov/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini

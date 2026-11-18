@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: kiwi-backend
+    runtime: python
+    rootDir: backend
+    plan: free
+    region: oregon
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: alembic -c alembic.ini upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /v1/health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DATABASE_URL
+        sync: false
+      - key: INTERNAL_API_SECRET
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: YUKISBOX_BASE_URL
+        value: https://yukiapi.site
+      - key: JIOSAAVN_API_URL
+        value: https://saavn.dev
+      - key: YUKISBOX_TIMEOUT
+        value: "300"
+      - key: MAX_UPLOAD_CONCURRENCY
+        value: "3"
+      - key: MAX_DOWNLOAD_SIZE_MB
+        value: "100"
