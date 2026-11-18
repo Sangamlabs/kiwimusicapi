@@ -3,9 +3,14 @@
 # -------------------------------------------------------------
 # Stage 1: Build high-performance Rust streaming engine
 # -------------------------------------------------------------
-FROM rust:1.85-slim AS rust-builder
+FROM rust:latest AS rust-builder
 
 WORKDIR /usr/src/rust-streamer
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY rust-streamer/Cargo.toml rust-streamer/Cargo.lock ./
 COPY rust-streamer/src ./src
