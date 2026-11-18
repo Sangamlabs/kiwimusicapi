@@ -1,17 +1,13 @@
 services:
   - type: web
     name: kiwi-backend
-    runtime: python
-    rootDir: backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
     plan: free
     region: oregon
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: alembic -c alembic.ini upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /v1/health
     autoDeploy: true
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
       - key: DATABASE_URL
         sync: false
       - key: INTERNAL_API_SECRET
@@ -28,4 +24,3 @@ services:
         value: "3"
       - key: MAX_DOWNLOAD_SIZE_MB
         value: "100"
-
