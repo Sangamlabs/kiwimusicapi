@@ -53,7 +53,7 @@ pub struct DbTrackRecord {
 pub struct PostgresManager {
     conn_str: String,
     use_tls: bool,
-    client: Arc<RwLock<Option<Client>>>,
+    client: Arc<RwLock<Option<Arc<Client>>>>,
 }
 
 impl PostgresManager {
@@ -122,15 +122,15 @@ impl PostgresManager {
         }
     }
 
-    /// Retrieve or establish a multiplexed PostgreSQL client.
+    /// Retrieve or establish a multiplexed PostgreSQL client wrapped in an Arc.
     /// tokio_postgres::Client pipelines queries over a single connection actor.
-    async fn get_client(&self) -> Result<Client, DbError> {
+    async fn get_client(&self) -> Result<Arc<Client>, DbError> {
         // Fast-path read lock: reuse existing active connection
         {
             let guard = self.client.read().await;
             if let Some(ref c) = *guard {
                 if !c.is_closed() {
-                    return Ok(c.clone());
+                    return Ok(Arc::clone(c));
                 }
             }
         }
@@ -139,12 +139,12 @@ impl PostgresManager {
         let mut guard = self.client.write().await;
         if let Some(ref c) = *guard {
             if !c.is_closed() {
-                return Ok(c.clone());
+                return Ok(Arc::clone(c));
             }
         }
 
-        let new_client = self.connect().await?;
-        *guard = Some(new_client.clone());
+        let new_client = Arc::new(self.connect().await?);
+        *guard = Some(Arc::clone(&new_client));
         Ok(new_client)
     }
 
