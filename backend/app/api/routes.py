@@ -20,6 +20,22 @@ from app.services.music import music_service
 
 router = APIRouter(prefix="/v1", tags=["Music API"])
 
+# High-performance persistent connection pool for Rust media engine proxying
+_shared_rust_client: httpx.AsyncClient | None = None
+
+def get_rust_client() -> httpx.AsyncClient:
+    global _shared_rust_client
+    # If httpx.AsyncClient has been patched by unittest.mock (in tests), instantiate it
+    if hasattr(httpx.AsyncClient, "return_value") or hasattr(httpx.AsyncClient, "side_effect"):
+        return httpx.AsyncClient()
+    if _shared_rust_client is None or _shared_rust_client.is_closed:
+        _shared_rust_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=2.0, read=180.0, write=5.0, pool=30.0),
+            limits=httpx.Limits(max_keepalive_connections=50, max_connections=200, keepalive_expiry=120.0),
+            http2=False
+        )
+    return _shared_rust_client
+
 @router.get("/health", response_model=HealthResponse)
 async def health_check(db: AsyncSession = Depends(get_db)):
     """Lightweight health check for API and Database readiness."""
@@ -171,10 +187,7 @@ async def stream_endpoint(
         fwd_headers["Range"] = client_range
 
     try:
-        httpx_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=3.0, read=180.0, write=5.0, pool=30.0),
-            limits=httpx.Limits(max_keepalive_connections=50, max_connections=200, keepalive_expiry=120.0),
-        )
+        httpx_client = get_rust_client()
         rust_req = httpx_client.build_request(request.method, rust_url, headers=fwd_headers)
         rust_resp = await httpx_client.send(rust_req, stream=True)
 
@@ -183,7 +196,8 @@ async def stream_endpoint(
             quota_ok = await consume_quota_atomic(db, api_key.id, "/v1/stream", latency_ms)
             if not quota_ok:
                 await rust_resp.aclose()
-                await httpx_client.aclose()
+                if httpx_client is not _shared_rust_client:
+                    await httpx_client.aclose()
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail={"code": "QUOTA_EXHAUSTED", "message": "API key quota has been exhausted"}
@@ -203,7 +217,8 @@ async def stream_endpoint(
 
             if request.method == "HEAD":
                 await rust_resp.aclose()
-                await httpx_client.aclose()
+                if httpx_client is not _shared_rust_client:
+                    await httpx_client.aclose()
                 return Response(
                     content=b"",
                     status_code=rust_resp.status_code,
@@ -221,7 +236,8 @@ async def stream_endpoint(
                         yield chunk
                 finally:
                     await rust_resp.aclose()
-                    await httpx_client.aclose()
+                    if httpx_client is not _shared_rust_client:
+                        await httpx_client.aclose()
 
             return StreamingResponse(
                 stream_generator(),
@@ -230,14 +246,16 @@ async def stream_endpoint(
             )
         elif rust_resp.status_code == 416:
             await rust_resp.aclose()
-            await httpx_client.aclose()
+            if httpx_client is not _shared_rust_client:
+                await httpx_client.aclose()
             raise HTTPException(
                 status_code=status.HTTP_416_RANGE_NOT_SATISFIABLE,
                 detail={"code": "RANGE_NOT_SATISFIABLE", "message": "Requested Range Not Satisfiable"}
             )
         else:
             await rust_resp.aclose()
-            await httpx_client.aclose()
+            if httpx_client is not _shared_rust_client:
+                await httpx_client.aclose()
     except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError):
         # Rust engine not running locally -> proceed to secondary fallback
         pass

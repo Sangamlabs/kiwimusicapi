@@ -4,8 +4,10 @@ use des::Des;
 use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, USER_AGENT};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::error::ProviderError;
@@ -13,10 +15,34 @@ use crate::models::TrackMetadata;
 
 const DES_CIPHER_KEY: &[u8; 8] = b"38346591";
 
+static STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    [
+        "the", "a", "an", "and", "or", "in", "on", "at", "to", "for", "of", "with", "by", "ft",
+        "feat", "song", "video", "official", "4k", "8k", "hd", "1080p", "720p", "lyrics",
+        "lyric", "audio", "full", "visualizer", "edit", "amv", "remix", "version", "records",
+        "music",
+    ]
+    .iter()
+    .copied()
+    .collect()
+});
+
+static TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[a-zA-Z0-9]+").unwrap());
+static YT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_-]{11}$").unwrap());
+static NOISE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(4k|8k|hd|1080p|720p|official music video|official video|full video song|full video|video song|music video|official audio|lyric video|lyrics video|lyrics|audio song|full song|visualizer|tiktok version|tiktok remix|edit audio|edit|amv|video|audio|song)\b").unwrap()
+});
+static BRACKETS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\(\[\{][^\)\]\}]*[\)\]\}]").unwrap());
+static NON_ASCII_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[^\x00-\x7F]+").unwrap());
+static FT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(ft\.?|feat\.?).*$").unwrap());
+
 pub struct JioSaavnProvider {
     client: reqwest::Client,
     base_url: Option<String>,
     match_threshold: f64,
+    oembed_cache: Arc<RwLock<HashMap<String, String>>>,
+    track_cache: Arc<RwLock<HashMap<String, TrackMetadata>>>,
+    search_cache: Arc<RwLock<HashMap<String, Vec<TrackMetadata>>>>,
 }
 
 impl JioSaavnProvider {
@@ -33,6 +59,10 @@ impl JioSaavnProvider {
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(Duration::from_secs(timeout_secs))
+            .connect_timeout(Duration::from_secs(3))
+            .pool_idle_timeout(Duration::from_secs(120))
+            .pool_max_idle_per_host(25)
+            .tcp_nodelay(true)
             .build()
             .unwrap_or_default();
 
@@ -40,6 +70,9 @@ impl JioSaavnProvider {
             client,
             base_url,
             match_threshold,
+            oembed_cache: Arc::new(RwLock::new(HashMap::new())),
+            track_cache: Arc::new(RwLock::new(HashMap::new())),
+            search_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -99,50 +132,10 @@ impl JioSaavnProvider {
 
     /// Extract meaningful alphanumeric tokens from text and strip common stopwords.
     pub fn get_tokens(text: &str) -> HashSet<String> {
-        let stop_words: HashSet<&'static str> = [
-            "the",
-            "a",
-            "an",
-            "and",
-            "or",
-            "in",
-            "on",
-            "at",
-            "to",
-            "for",
-            "of",
-            "with",
-            "by",
-            "ft",
-            "feat",
-            "song",
-            "video",
-            "official",
-            "4k",
-            "8k",
-            "hd",
-            "1080p",
-            "720p",
-            "lyrics",
-            "lyric",
-            "audio",
-            "full",
-            "visualizer",
-            "edit",
-            "amv",
-            "remix",
-            "version",
-            "records",
-            "music",
-        ]
-        .iter()
-        .copied()
-        .collect();
-
-        let re = Regex::new(r"[a-zA-Z0-9]+").unwrap();
-        re.find_iter(text)
+        TOKEN_RE
+            .find_iter(text)
             .map(|m| m.as_str().to_lowercase())
-            .filter(|w| !stop_words.contains(w.as_str()) && w.len() > 1)
+            .filter(|w| !STOP_WORDS.contains(w.as_str()) && w.len() > 1)
             .collect()
     }
 
@@ -183,9 +176,6 @@ impl JioSaavnProvider {
     /// Generate cleaned progressive search candidates from raw titles.
     pub fn generate_search_candidates(raw_title: &str) -> Vec<String> {
         let mut candidates = Vec::new();
-        let noise_re = Regex::new(r"(?i)\b(4k|8k|hd|1080p|720p|official music video|official video|full video song|full video|video song|music video|official audio|lyric video|lyrics video|lyrics|audio song|full song|visualizer|tiktok version|tiktok remix|edit audio|edit|amv|video|audio|song)\b").unwrap();
-        let brackets_re = Regex::new(r"[\(\[\{][^\)\]\}]*[\)\]\}]").unwrap();
-        let non_ascii_re = Regex::new(r"[^\x00-\x7F]+").unwrap();
 
         fn add_candidate(candidates: &mut Vec<String>, s: &str) {
             let clean = s.trim().trim_matches(|c| c == '-' || c == '|' || c == ':');
@@ -199,9 +189,9 @@ impl JioSaavnProvider {
         let mut clean_parts = Vec::new();
 
         for part in raw_parts {
-            let no_brackets = brackets_re.replace_all(part, " ");
-            let no_noise = noise_re.replace_all(&no_brackets, " ");
-            let ascii = non_ascii_re.replace_all(&no_noise, " ");
+            let no_brackets = BRACKETS_RE.replace_all(part, " ");
+            let no_noise = NOISE_RE.replace_all(&no_brackets, " ");
+            let ascii = NON_ASCII_RE.replace_all(&no_noise, " ");
             let clean = ascii
                 .trim()
                 .trim_matches(|c| c == '-' || c == '|' || c == ':');
@@ -225,13 +215,12 @@ impl JioSaavnProvider {
         }
 
         // Clean raw
-        let no_brackets = brackets_re.replace_all(raw_title, " ");
-        let no_noise = noise_re.replace_all(&no_brackets, " ");
-        let clean_raw = non_ascii_re.replace_all(&no_noise, " ");
+        let no_brackets = BRACKETS_RE.replace_all(raw_title, " ");
+        let no_noise = NOISE_RE.replace_all(&no_brackets, " ");
+        let clean_raw = NON_ASCII_RE.replace_all(&no_noise, " ");
 
         // Cut before ft./feat.
-        let ft_re = Regex::new(r"(?i)\b(ft\.?|feat\.?).*$").unwrap();
-        let no_ft = ft_re.replace_all(&clean_raw, " ");
+        let no_ft = FT_RE.replace_all(&clean_raw, " ");
         add_candidate(&mut candidates, &no_ft);
 
         add_candidate(&mut candidates, &clean_raw);
@@ -347,6 +336,14 @@ impl JioSaavnProvider {
             return Ok(Vec::new());
         }
 
+        let cache_key = format!("{}:{}", clean_query.to_lowercase(), limit);
+        {
+            let read = self.search_cache.read().await;
+            if let Some(cached) = read.get(&cache_key) {
+                return Ok(cached.clone());
+            }
+        }
+
         // 1. Try Sumanjay API base URL if configured
         if let Some(ref base) = self.base_url {
             let url = format!(
@@ -364,6 +361,8 @@ impl JioSaavnProvider {
                                 .filter_map(Self::normalize_item)
                                 .collect();
                             if !results.is_empty() {
+                                let mut write = self.search_cache.write().await;
+                                write.insert(cache_key, results.clone());
                                 return Ok(results);
                             }
                         } else if let Some(arr) = val.get("results").and_then(|r| r.as_array()) {
@@ -373,6 +372,8 @@ impl JioSaavnProvider {
                                 .filter_map(Self::normalize_item)
                                 .collect();
                             if !results.is_empty() {
+                                let mut write = self.search_cache.write().await;
+                                write.insert(cache_key, results.clone());
                                 return Ok(results);
                             }
                         }
@@ -382,7 +383,7 @@ impl JioSaavnProvider {
         }
 
         // 2. Direct native JioSaavn API call
-        let n_str = limit.min(20).to_string();
+        let n_str = limit.min(10).to_string();
         let params = [
             ("__call", "search.getResults"),
             ("_format", "json"),
@@ -428,6 +429,11 @@ impl JioSaavnProvider {
             })
             .unwrap_or_default();
 
+        if !results.is_empty() {
+            let mut write = self.search_cache.write().await;
+            write.insert(cache_key, results.clone());
+        }
+
         Ok(results)
     }
 
@@ -436,6 +442,14 @@ impl JioSaavnProvider {
         let clean_id = track_id.trim();
         if clean_id.is_empty() {
             return Ok(None);
+        }
+
+        // 0. High-speed In-Memory Track Cache (< 0.1ms)
+        {
+            let read = self.track_cache.read().await;
+            if let Some(cached) = read.get(clean_id) {
+                return Ok(Some(cached.clone()));
+            }
         }
 
         // 1. Direct JioSaavn ID (e.g. kiwi_saavn_12345 or numeric 12345)
@@ -467,6 +481,10 @@ impl JioSaavnProvider {
                     {
                         if let Some(mut track) = Self::normalize_item(item) {
                             track.track_id = format!("kiwi_saavn_{}", numeric_id);
+                            {
+                                let mut write = self.track_cache.write().await;
+                                write.insert(clean_id.to_string(), track.clone());
+                            }
                             return Ok(Some(track));
                         }
                     }
@@ -475,59 +493,87 @@ impl JioSaavnProvider {
         }
 
         // 2. YouTube Video ID (11 chars alphanumeric / dashes / underscores)
-        let yt_re = Regex::new(r"^[a-zA-Z0-9_-]{11}$").unwrap();
-        if yt_re.is_match(clean_id) {
-            let oembed_url = format!(
-                "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={}&format=json",
-                clean_id
-            );
+        if YT_RE.is_match(clean_id) {
+            let maybe_title = {
+                let read = self.oembed_cache.read().await;
+                read.get(clean_id).cloned()
+            };
 
-            if let Ok(oembed_resp) = self.client.get(&oembed_url).send().await {
-                if oembed_resp.status().is_success() {
-                    if let Ok(oembed_data) = oembed_resp.json::<Value>().await {
-                        if let Some(yt_title) = oembed_data.get("title").and_then(|t| t.as_str()) {
-                            let mut best_match: Option<TrackMetadata> = None;
-                            let mut best_score = 0.0;
-
-                            for candidate in Self::generate_search_candidates(yt_title) {
-                                if let Ok(results) = self.search(&candidate, 5).await {
-                                    for item in results {
-                                        let score = Self::score_match(
-                                            yt_title,
-                                            &item.title,
-                                            &item.artist,
-                                            item.album.as_deref().unwrap_or(""),
-                                        );
-                                        if score > best_score {
-                                            best_score = score;
-                                            best_match = Some(item);
-                                        }
-                                    }
+            let yt_title = match maybe_title {
+                Some(title) => title,
+                None => {
+                    let oembed_url = format!(
+                        "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={}&format=json",
+                        clean_id
+                    );
+                    let mut title = None;
+                    if let Ok(oembed_resp) = self.client.get(&oembed_url).send().await {
+                        if oembed_resp.status().is_success() {
+                            if let Ok(oembed_data) = oembed_resp.json::<Value>().await {
+                                if let Some(t) = oembed_data.get("title").and_then(|t| t.as_str()) {
+                                    title = Some(t.to_string());
                                 }
-                                if best_score >= 1.0 {
-                                    break;
-                                }
-                            }
-
-                            if best_score >= self.match_threshold {
-                                if let Some(mut matched) = best_match {
-                                    info!(
-                                        "Matched YouTube ID {} ('{}') with JioSaavn '{}' (score={:.2})",
-                                        clean_id, yt_title, matched.title, best_score
-                                    );
-                                    matched.track_id = clean_id.to_string();
-                                    return Ok(Some(matched));
-                                }
-                            } else {
-                                warn!(
-                                    "No confident match for YouTube ID {} ('{}', best_score={:.2} < threshold={:.2})",
-                                    clean_id, yt_title, best_score, self.match_threshold
-                                );
-                                return Ok(None);
                             }
                         }
                     }
+                    match title {
+                        Some(t) => {
+                            let mut write = self.oembed_cache.write().await;
+                            write.insert(clean_id.to_string(), t.clone());
+                            t
+                        }
+                        None => {
+                            warn!("Failed to fetch oEmbed title for YouTube ID {}", clean_id);
+                            return Ok(None);
+                        }
+                    }
                 }
+            };
+
+            let candidates = Self::generate_search_candidates(&yt_title);
+            let mut best_match: Option<TrackMetadata> = None;
+            let mut best_score = 0.0;
+
+            for candidate in candidates {
+                if let Ok(results) = self.search(&candidate, 5).await {
+                    for item in results {
+                        let score = Self::score_match(
+                            &yt_title,
+                            &item.title,
+                            &item.artist,
+                            item.album.as_deref().unwrap_or(""),
+                        );
+                        if score > best_score {
+                            best_score = score;
+                            best_match = Some(item);
+                        }
+                    }
+                }
+                // Break early on confident match (>= 0.80) to eliminate redundant roundtrips!
+                if best_score >= 0.80 {
+                    break;
+                }
+            }
+
+            if best_score >= self.match_threshold {
+                if let Some(mut matched) = best_match {
+                    info!(
+                        "Matched YouTube ID {} ('{}') with JioSaavn '{}' (score={:.2})",
+                        clean_id, yt_title, matched.title, best_score
+                    );
+                    matched.track_id = clean_id.to_string();
+                    {
+                        let mut write = self.track_cache.write().await;
+                        write.insert(clean_id.to_string(), matched.clone());
+                    }
+                    return Ok(Some(matched));
+                }
+            } else {
+                warn!(
+                    "No confident match for YouTube ID {} ('{}', best_score={:.2} < threshold={:.2})",
+                    clean_id, yt_title, best_score, self.match_threshold
+                );
+                return Ok(None);
             }
         }
 
@@ -550,7 +596,7 @@ impl JioSaavnProvider {
                     }
                 }
             }
-            if best_score >= 1.0 {
+            if best_score >= 0.80 {
                 break;
             }
         }
@@ -558,6 +604,10 @@ impl JioSaavnProvider {
         if best_score >= self.match_threshold {
             if let Some(mut matched) = best_match {
                 matched.track_id = clean_id.to_string();
+                {
+                    let mut write = self.track_cache.write().await;
+                    write.insert(clean_id.to_string(), matched.clone());
+                }
                 return Ok(Some(matched));
             }
         }

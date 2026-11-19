@@ -372,7 +372,14 @@ async fn proxy_upstream_stream(
     range_header: Option<&HeaderValue>,
     audio_format: &str,
 ) -> Result<Response, String> {
-    let mut req = client.get(upstream_url);
+    let mut req = client
+        .get(upstream_url)
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
+        .header(reqwest::header::ACCEPT, "*/*")
+        .header(reqwest::header::ACCEPT_ENCODING, "identity");
 
     // Propagate Range header if provided by client
     if let Some(range) = range_header {
