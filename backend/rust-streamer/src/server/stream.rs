@@ -6,8 +6,10 @@ use axum::{
 };
 use futures_util::TryStreamExt;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{error, info, warn};
 
 use crate::acquisition::AcquisitionCoordinator;
@@ -28,7 +30,8 @@ pub struct AppState {
     pub storage: Arc<YukisboxStorage>,
     pub coordinator: Arc<AcquisitionCoordinator>,
     pub http_client: reqwest::Client,
-    pub stream_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<String, CachedStreamUrl>>>,
+    pub stream_cache: Arc<RwLock<HashMap<String, CachedStreamUrl>>>,
+    pub flight_group: Arc<Mutex<HashMap<String, broadcast::Sender<Result<CachedStreamUrl, String>>>>>,
 }
 
 impl AppState {
@@ -41,7 +44,7 @@ impl AppState {
             .timeout(Duration::from_secs(60))
             .connect_timeout(Duration::from_secs(5))
             .pool_idle_timeout(Duration::from_secs(120))
-            .pool_max_idle_per_host(30)
+            .pool_max_idle_per_host(100)
             .tcp_nodelay(true)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
@@ -51,7 +54,8 @@ impl AppState {
             storage,
             coordinator,
             http_client,
-            stream_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            stream_cache: Arc::new(RwLock::new(HashMap::new())),
+            flight_group: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -64,8 +68,148 @@ pub async fn health_handler() -> impl IntoResponse {
     }))
 }
 
+/// Single-Flight Track Stream Target Resolver:
+/// Resolves the canonical direct audio URL across PostgreSQL storage cache, JioSaavn, yt-dlp, and Yukysbox.
+async fn resolve_stream_target(
+    state: &AppState,
+    clean_track_id: &str,
+) -> Result<CachedStreamUrl, String> {
+    // 1. High-speed PostgreSQL verified storage cache check (< 2ms)
+    if let Some(cached) = state.coordinator.find_cached(clean_track_id).await {
+        if let Ok(safe_url) = validate_url_ssrf(&cached.storage_url) {
+            info!(
+                "Stream: Resolved from PostgreSQL storage cache for '{}'",
+                clean_track_id
+            );
+            return Ok(CachedStreamUrl {
+                url: safe_url.as_str().to_string(),
+                audio_format: cached.audio_format,
+                created_at: std::time::Instant::now(),
+            });
+        }
+    }
+
+    // 2. Primary Direct Provider: JioSaavn
+    info!(
+        "Stream: Attempting primary direct stream via JioSaavn for '{}'...",
+        clean_track_id
+    );
+    match state
+        .provider_manager
+        .jiosaavn()
+        .get_track(clean_track_id)
+        .await
+    {
+        Ok(Some(meta)) => {
+            if let Ok(safe_url) = validate_url_ssrf(&meta.source_url) {
+                info!(
+                    "Stream: Resolved direct JioSaavn URL for '{}'",
+                    clean_track_id
+                );
+                return Ok(CachedStreamUrl {
+                    url: safe_url.as_str().to_string(),
+                    audio_format: meta.audio_format,
+                    created_at: std::time::Instant::now(),
+                });
+            } else {
+                warn!(
+                    "Stream: JioSaavn source URL rejected by SSRF guard for '{}'",
+                    clean_track_id
+                );
+            }
+        }
+        Ok(None) => {
+            info!(
+                "Stream: Track '{}' not found on JioSaavn. Falling back to yt-dlp.",
+                clean_track_id
+            );
+        }
+        Err(e) => {
+            warn!(
+                "Stream: JioSaavn resolution error for '{}': {}. Falling back to yt-dlp.",
+                clean_track_id, e
+            );
+        }
+    }
+
+    // 3. Secondary Direct Provider: Managed yt-dlp
+    info!(
+        "Stream: Attempting secondary direct stream via yt-dlp for '{}'...",
+        clean_track_id
+    );
+    match state
+        .provider_manager
+        .ytdlp()
+        .extract_info(clean_track_id)
+        .await
+    {
+        Ok(Some(meta)) => {
+            if let Ok(safe_url) = validate_url_ssrf(&meta.source_url) {
+                info!(
+                    "Stream: Resolved direct yt-dlp URL for '{}'",
+                    clean_track_id
+                );
+                return Ok(CachedStreamUrl {
+                    url: safe_url.as_str().to_string(),
+                    audio_format: meta.audio_format,
+                    created_at: std::time::Instant::now(),
+                });
+            } else {
+                warn!(
+                    "Stream: yt-dlp source URL rejected by SSRF guard for '{}'",
+                    clean_track_id
+                );
+            }
+        }
+        Ok(None) => {
+            info!(
+                "Stream: Track '{}' not resolved by yt-dlp. Falling back to Yukysbox.",
+                clean_track_id
+            );
+        }
+        Err(e) => {
+            warn!(
+                "Stream: yt-dlp resolution error for '{}': {}. Falling back to Yukysbox.",
+                clean_track_id, e
+            );
+        }
+    }
+
+    // 4. Fallback Storage Workflow: Yukysbox Persistent Cache/Acquisition
+    info!(
+        "Stream: All direct providers failed. Invoking Yukysbox fallback for '{}'...",
+        clean_track_id
+    );
+    match state.coordinator.acquire(clean_track_id, None).await {
+        Ok(acquired) => {
+            if let Ok(safe_url) = validate_url_ssrf(&acquired.storage_url) {
+                info!(
+                    "Stream: Resolved Yukysbox storage URL for '{}'",
+                    clean_track_id
+                );
+                return Ok(CachedStreamUrl {
+                    url: safe_url.as_str().to_string(),
+                    audio_format: acquired.audio_format,
+                    created_at: std::time::Instant::now(),
+                });
+            }
+        }
+        Err(e) => {
+            error!(
+                "Stream: Yukysbox acquisition fallback failed for '{}': {}",
+                clean_track_id, e
+            );
+        }
+    }
+
+    Err(format!(
+        "Unable to stream track '{}' across all eligible providers and storage",
+        clean_track_id
+    ))
+}
+
 /// Primary Playback Handler:
-/// Direct Provider Streaming (JioSaavn -> yt-dlp) with HTTP Range support and Yukysbox Storage fallback.
+/// Direct Provider Streaming with HTTP Range support, multi-user single-flight request grabber, and Yukysbox fallback.
 pub async fn stream_handler(
     State(state): State<AppState>,
     Path(track_id): Path<String>,
@@ -89,11 +233,19 @@ pub async fn stream_handler(
                     .await
                     {
                         Ok(resp) => {
-                            info!("Stream: In-memory cache HIT for '{}' (sub-millisecond)", clean_track_id);
+                            info!(
+                                "Stream: In-memory cache HIT for '{}' (sub-millisecond)",
+                                clean_track_id
+                            );
                             return resp;
                         }
                         Err(e) => {
-                            warn!("Stream: Cached in-memory URL stream failed ({}). Refetching.", e);
+                            warn!(
+                                "Stream: Cached in-memory URL stream failed ({}). Evicting dead entry.",
+                                e
+                            );
+                            drop(cache_read);
+                            state.stream_cache.write().await.remove(clean_track_id);
                         }
                     }
                 }
@@ -101,232 +253,89 @@ pub async fn stream_handler(
         }
     }
 
-    // 0.1 High-speed PostgreSQL verified storage cache check (< 2ms)
-    if let Some(cached) = state.coordinator.find_cached(clean_track_id).await {
-        if let Ok(safe_url) = validate_url_ssrf(&cached.storage_url) {
-            {
-                let mut cache_write = state.stream_cache.write().await;
-                cache_write.insert(
-                    clean_track_id.to_string(),
-                    CachedStreamUrl {
-                        url: cached.storage_url.clone(),
-                        audio_format: cached.audio_format.clone(),
-                        created_at: std::time::Instant::now(),
-                    },
-                );
+    // 1. Single-Flight Request Grabber & Coalescer:
+    // If multiple concurrent users request this track at the exact same moment,
+    // only ONE upstream resolution task executes. All others subscribe and receive the result simultaneously.
+    let resolved_result = {
+        let mut inflight = state.flight_group.lock().await;
+        if let Some(tx) = inflight.get(clean_track_id) {
+            let mut rx = tx.subscribe();
+            drop(inflight);
+            info!(
+                "Stream: Multiple users requesting '{}' - subscribed to in-flight grabber",
+                clean_track_id
+            );
+            match rx.recv().await {
+                Ok(res) => res,
+                Err(_) => resolve_stream_target(&state, clean_track_id).await,
             }
+        } else {
+            let (tx, _rx) = broadcast::channel(64);
+            inflight.insert(clean_track_id.to_string(), tx.clone());
+            drop(inflight);
+
+            let res = resolve_stream_target(&state, clean_track_id).await;
+
+            // Cache successfully resolved stream target
+            if let Ok(ref entry) = res {
+                let mut cache_write = state.stream_cache.write().await;
+                cache_write.insert(clean_track_id.to_string(), entry.clone());
+            }
+
+            // Broadcast resolved target to all queued concurrent user requests
+            let _ = tx.send(res.clone());
+
+            // Remove from flight group
+            let mut inflight = state.flight_group.lock().await;
+            inflight.remove(clean_track_id);
+
+            res
+        }
+    };
+
+    // 2. Stream audio chunks to client with Range and backpressure support
+    match resolved_result {
+        Ok(entry) => {
             match proxy_upstream_stream(
                 &state.http_client,
-                safe_url.as_str(),
+                &entry.url,
                 range_header.as_ref(),
-                &cached.audio_format,
+                &entry.audio_format,
             )
             .await
             {
-                Ok(resp) => {
-                    info!("Stream: Served from PostgreSQL storage cache for '{}'", clean_track_id);
-                    return resp;
-                }
+                Ok(resp) => resp,
                 Err(e) => {
-                    warn!("Stream: Database cached stream failed ({}). Falling back to direct providers.", e);
+                    error!(
+                        "Stream: Upstream proxy failed for '{}': {}",
+                        clean_track_id, e
+                    );
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({
+                            "success": false,
+                            "error": {
+                                "code": "UPSTREAM_STREAM_ERROR",
+                                "message": format!("Upstream stream failed: {}", e)
+                            }
+                        })),
+                    )
+                        .into_response()
                 }
             }
         }
-    }
-
-    // 1. Primary Direct Provider: JioSaavn
-    info!(
-        "Stream: Attempting primary direct stream via JioSaavn for '{}'...",
-        clean_track_id
-    );
-    match state
-        .provider_manager
-        .jiosaavn()
-        .get_track(clean_track_id)
-        .await
-    {
-        Ok(Some(meta)) => {
-            if let Ok(safe_url) = validate_url_ssrf(&meta.source_url) {
-                match proxy_upstream_stream(
-                    &state.http_client,
-                    safe_url.as_str(),
-                    range_header.as_ref(),
-                    &meta.audio_format,
-                )
-                .await
-                {
-                    Ok(resp) => {
-                        info!(
-                            "Stream: Direct JioSaavn stream established for '{}'",
-                            clean_track_id
-                        );
-                        // Cache resolved stream URL in memory for instant subsequent range requests
-                        {
-                            let mut cache_write = state.stream_cache.write().await;
-                            cache_write.insert(
-                                clean_track_id.to_string(),
-                                CachedStreamUrl {
-                                    url: safe_url.as_str().to_string(),
-                                    audio_format: meta.audio_format.clone(),
-                                    created_at: std::time::Instant::now(),
-                                },
-                            );
-                        }
-                        return resp;
-                    }
-                    Err(e) => {
-                        warn!("Stream: JioSaavn upstream failed before first byte ({}). Falling back to yt-dlp.", e);
-                    }
+        Err(err_msg) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "success": false,
+                "error": {
+                    "code": "TRACK_NOT_FOUND",
+                    "message": err_msg
                 }
-            } else {
-                warn!(
-                    "Stream: JioSaavn source URL rejected by SSRF guard for '{}'",
-                    clean_track_id
-                );
-            }
-        }
-        Ok(None) => {
-            info!(
-                "Stream: Track '{}' not found on JioSaavn. Falling back to yt-dlp.",
-                clean_track_id
-            );
-        }
-        Err(e) => {
-            warn!(
-                "Stream: JioSaavn resolution error for '{}': {}. Falling back to yt-dlp.",
-                clean_track_id, e
-            );
-        }
+            })),
+        )
+            .into_response(),
     }
-
-    // 2. Secondary Direct Provider: Managed yt-dlp
-    info!(
-        "Stream: Attempting secondary direct stream via yt-dlp for '{}'...",
-        clean_track_id
-    );
-    match state
-        .provider_manager
-        .ytdlp()
-        .extract_info(clean_track_id)
-        .await
-    {
-        Ok(Some(meta)) => {
-            if let Ok(safe_url) = validate_url_ssrf(&meta.source_url) {
-                match proxy_upstream_stream(
-                    &state.http_client,
-                    safe_url.as_str(),
-                    range_header.as_ref(),
-                    &meta.audio_format,
-                )
-                .await
-                {
-                    Ok(resp) => {
-                        info!(
-                            "Stream: Direct yt-dlp stream established for '{}'",
-                            clean_track_id
-                        );
-                        // Cache resolved stream URL in memory for instant subsequent range requests
-                        {
-                            let mut cache_write = state.stream_cache.write().await;
-                            cache_write.insert(
-                                clean_track_id.to_string(),
-                                CachedStreamUrl {
-                                    url: safe_url.as_str().to_string(),
-                                    audio_format: meta.audio_format.clone(),
-                                    created_at: std::time::Instant::now(),
-                                },
-                            );
-                        }
-                        return resp;
-                    }
-                    Err(e) => {
-                        warn!("Stream: yt-dlp upstream failed before first byte ({}). Falling back to Yukysbox.", e);
-                    }
-                }
-            } else {
-                warn!(
-                    "Stream: yt-dlp source URL rejected by SSRF guard for '{}'",
-                    clean_track_id
-                );
-            }
-        }
-        Ok(None) => {
-            info!(
-                "Stream: Track '{}' not resolved by yt-dlp. Falling back to Yukysbox.",
-                clean_track_id
-            );
-        }
-        Err(e) => {
-            warn!(
-                "Stream: yt-dlp resolution error for '{}': {}. Falling back to Yukysbox.",
-                clean_track_id, e
-            );
-        }
-    }
-
-    // 3. Fallback Storage Workflow: Yukysbox Persistent Cache/Acquisition
-    info!(
-        "Stream: All direct providers failed. Invoking Yukysbox fallback for '{}'...",
-        clean_track_id
-    );
-    match state.coordinator.acquire(clean_track_id, None).await {
-        Ok(acquired) => {
-            if let Ok(safe_url) = validate_url_ssrf(&acquired.storage_url) {
-                match proxy_upstream_stream(
-                    &state.http_client,
-                    safe_url.as_str(),
-                    range_header.as_ref(),
-                    &acquired.audio_format,
-                )
-                .await
-                {
-                    Ok(resp) => {
-                        info!(
-                            "Stream: Yukysbox storage stream established for '{}'",
-                            clean_track_id
-                        );
-                        // Cache resolved stream URL in memory for instant subsequent range requests
-                        {
-                            let mut cache_write = state.stream_cache.write().await;
-                            cache_write.insert(
-                                clean_track_id.to_string(),
-                                CachedStreamUrl {
-                                    url: safe_url.as_str().to_string(),
-                                    audio_format: acquired.audio_format.clone(),
-                                    created_at: std::time::Instant::now(),
-                                },
-                            );
-                        }
-                        return resp;
-                    }
-                    Err(e) => {
-                        error!(
-                            "Stream: Yukysbox storage streaming failed for '{}': {}",
-                            clean_track_id, e
-                        );
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            error!(
-                "Stream: Yukysbox acquisition fallback failed for '{}': {}",
-                clean_track_id, e
-            );
-        }
-    }
-
-    // 4. All providers and storage fallback failed
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({
-            "success": false,
-            "error": {
-                "code": "TRACK_NOT_FOUND",
-                "message": format!("Unable to stream track '{}' across all eligible providers and storage", clean_track_id)
-            }
-        })),
-    ).into_response()
 }
 
 /// Internal Acquire Handler for Python FastAPI

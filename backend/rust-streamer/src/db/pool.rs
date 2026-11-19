@@ -1,7 +1,9 @@
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::RwLock;
 use tokio_postgres::{Client, NoTls};
 use tracing::{error, info};
 
@@ -47,9 +49,11 @@ pub struct DbTrackRecord {
     pub status: String,
 }
 
+#[derive(Clone)]
 pub struct PostgresManager {
     conn_str: String,
     use_tls: bool,
+    client: Arc<RwLock<Option<Client>>>,
 }
 
 impl PostgresManager {
@@ -79,6 +83,7 @@ impl PostgresManager {
         Ok(Self {
             conn_str: parsed_conn,
             use_tls,
+            client: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -117,18 +122,54 @@ impl PostgresManager {
         }
     }
 
+    /// Retrieve or establish a multiplexed PostgreSQL client.
+    /// tokio_postgres::Client pipelines queries over a single connection actor.
+    async fn get_client(&self) -> Result<Client, DbError> {
+        // Fast-path read lock: reuse existing active connection
+        {
+            let guard = self.client.read().await;
+            if let Some(ref c) = *guard {
+                if !c.is_closed() {
+                    return Ok(c.clone());
+                }
+            }
+        }
+
+        // Slow-path write lock: reconnect
+        let mut guard = self.client.write().await;
+        if let Some(ref c) = *guard {
+            if !c.is_closed() {
+                return Ok(c.clone());
+            }
+        }
+
+        let new_client = self.connect().await?;
+        *guard = Some(new_client.clone());
+        Ok(new_client)
+    }
+
+    async fn invalidate_client(&self) {
+        let mut guard = self.client.write().await;
+        *guard = None;
+    }
+
     /// Check if track already exists and is available in PostgreSQL `tracks` table
     pub async fn find_track(&self, track_id: &str) -> Result<Option<DbTrackRecord>, DbError> {
-        let client = self.connect().await?;
+        let client = self.get_client().await?;
         let query = "SELECT track_id, provider, provider_song_id, title, artist, album, \
                             duration, language, thumbnail, source_url, storage_provider, \
                             storage_uid, storage_url, file_size, audio_format, status \
                      FROM tracks WHERE track_id = $1 AND status = 'available' AND storage_url IS NOT NULL";
 
-        let row_opt = client
-            .query_opt(query, &[&track_id])
-            .await
-            .map_err(DbError::Postgres)?;
+        let row_opt = match client.query_opt(query, &[&track_id]).await {
+            Ok(r) => r,
+            Err(e) => {
+                if client.is_closed() {
+                    self.invalidate_client().await;
+                }
+                return Err(DbError::Postgres(e));
+            }
+        };
 
         if let Some(row) = row_opt {
             Ok(Some(DbTrackRecord {
@@ -161,7 +202,7 @@ impl PostgresManager {
         track_id: &str,
         lease_secs: i64,
     ) -> Result<LeaseResult, DbError> {
-        let client = self.connect().await?;
+        let client = self.get_client().await?;
 
         // 1. Check existing job with database-side age calculation
         let check_query = "SELECT status, \
@@ -170,10 +211,15 @@ impl PostgresManager {
                                        ELSE NULL \
                                   END AS age_secs \
                            FROM upload_jobs WHERE track_id = $1";
-        let existing = client
-            .query_opt(check_query, &[&track_id])
-            .await
-            .map_err(DbError::Postgres)?;
+        let existing = match client.query_opt(check_query, &[&track_id]).await {
+            Ok(res) => res,
+            Err(e) => {
+                if client.is_closed() {
+                    self.invalidate_client().await;
+                }
+                return Err(DbError::Postgres(e));
+            }
+        };
 
         if let Some(row) = existing {
             let status: String = row.get(0);
@@ -198,10 +244,15 @@ impl PostgresManager {
                                     attempts = attempts + 1, \
                                     updated_at = NOW() \
                                 WHERE track_id = $1";
-            client
-                .execute(update_query, &[&track_id])
-                .await
-                .map_err(DbError::Postgres)?;
+            match client.execute(update_query, &[&track_id]).await {
+                Ok(_) => {}
+                Err(e) => {
+                    if client.is_closed() {
+                        self.invalidate_client().await;
+                    }
+                    return Err(DbError::Postgres(e));
+                }
+            }
 
             info!("Reclaimed lease for track_id: {}", track_id);
             return Ok(LeaseResult::Acquired);
@@ -212,20 +263,30 @@ impl PostgresManager {
                             VALUES ($1, 'PROCESSING', 1, NOW(), NOW(), NOW()) \
                             ON CONFLICT (track_id) DO NOTHING";
 
-        let affected = client
-            .execute(insert_query, &[&track_id])
-            .await
-            .map_err(DbError::Postgres)?;
+        let affected = match client.execute(insert_query, &[&track_id]).await {
+            Ok(res) => res,
+            Err(e) => {
+                if client.is_closed() {
+                    self.invalidate_client().await;
+                }
+                return Err(DbError::Postgres(e));
+            }
+        };
 
         if affected == 1 {
             info!("Acquired new lease for track_id: {}", track_id);
             Ok(LeaseResult::Acquired)
         } else {
             // Concurrent insert race condition -> check again
-            let recheck = client
-                .query_opt(check_query, &[&track_id])
-                .await
-                .map_err(DbError::Postgres)?;
+            let recheck = match client.query_opt(check_query, &[&track_id]).await {
+                Ok(res) => res,
+                Err(e) => {
+                    if client.is_closed() {
+                        self.invalidate_client().await;
+                    }
+                    return Err(DbError::Postgres(e));
+                }
+            };
             if let Some(row) = recheck {
                 let status: String = row.get(0);
                 if status == "COMPLETED" {
@@ -242,39 +303,47 @@ impl PostgresManager {
 
     /// Mark upload_job as COMPLETED
     pub async fn mark_job_completed(&self, track_id: &str) -> Result<(), DbError> {
-        let client = self.connect().await?;
+        let client = self.get_client().await?;
         let query = "UPDATE upload_jobs \
                      SET status = 'COMPLETED', \
                          completed_at = NOW(), \
                          locked_at = NULL, \
                          updated_at = NOW() \
                      WHERE track_id = $1";
-        client
-            .execute(query, &[&track_id])
-            .await
-            .map_err(DbError::Postgres)?;
-        Ok(())
+        match client.execute(query, &[&track_id]).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if client.is_closed() {
+                    self.invalidate_client().await;
+                }
+                Err(DbError::Postgres(e))
+            }
+        }
     }
 
     /// Mark upload_job as FAILED and release lock
     pub async fn mark_job_failed(&self, track_id: &str, error_msg: &str) -> Result<(), DbError> {
-        let client = self.connect().await?;
+        let client = self.get_client().await?;
         let query = "UPDATE upload_jobs \
                      SET status = 'FAILED', \
                          last_error = $2, \
                          locked_at = NULL, \
                          updated_at = NOW() \
                      WHERE track_id = $1";
-        client
-            .execute(query, &[&track_id, &error_msg])
-            .await
-            .map_err(DbError::Postgres)?;
-        Ok(())
+        match client.execute(query, &[&track_id, &error_msg]).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if client.is_closed() {
+                    self.invalidate_client().await;
+                }
+                Err(DbError::Postgres(e))
+            }
+        }
     }
 
     /// Persist verified track to `tracks` table
     pub async fn upsert_track(&self, track: &DbTrackRecord) -> Result<(), DbError> {
-        let client = self.connect().await?;
+        let client = self.get_client().await?;
         let query = "INSERT INTO tracks (track_id, provider, provider_song_id, title, artist, album, \
                                          duration, language, thumbnail, source_url, storage_provider, \
                                          storage_uid, storage_url, file_size, audio_format, status, \
@@ -288,7 +357,7 @@ impl PostgresManager {
                          updated_at = NOW(), \
                          last_accessed_at = NOW()";
 
-        client
+        match client
             .execute(
                 query,
                 &[
@@ -311,8 +380,14 @@ impl PostgresManager {
                 ],
             )
             .await
-            .map_err(DbError::Postgres)?;
-
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if client.is_closed() {
+                    self.invalidate_client().await;
+                }
+                Err(DbError::Postgres(e))
+            }
+        }
     }
 }

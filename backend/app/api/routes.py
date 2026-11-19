@@ -31,7 +31,7 @@ def get_rust_client() -> httpx.AsyncClient:
     if _shared_rust_client is None or _shared_rust_client.is_closed:
         _shared_rust_client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=2.0, read=180.0, write=5.0, pool=30.0),
-            limits=httpx.Limits(max_keepalive_connections=50, max_connections=200, keepalive_expiry=120.0),
+            limits=httpx.Limits(max_keepalive_connections=100, max_connections=500, keepalive_expiry=120.0),
             http2=False
         )
     return _shared_rust_client

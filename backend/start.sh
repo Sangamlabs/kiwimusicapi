@@ -33,10 +33,11 @@ cleanup() {
 
 trap cleanup TERM INT
 
-# 3. Start Python FastAPI via Uvicorn in foreground
+# 3. Start Python FastAPI via Uvicorn in foreground with multi-worker concurrency
 WEB_PORT="${PORT:-8000}"
-echo "[STARTUP] Launching Python FastAPI on port ${WEB_PORT}..."
-uvicorn app.main:app --host 0.0.0.0 --port "${WEB_PORT}" &
+WORKERS="${WEB_CONCURRENCY:-2}"
+echo "[STARTUP] Launching Python FastAPI on port ${WEB_PORT} with ${WORKERS} workers..."
+uvicorn app.main:app --host 0.0.0.0 --port "${WEB_PORT}" --workers "${WORKERS}" --limit-concurrency 1000 --backlog 2048 &
 UVICORN_PID=$!
 
 wait "$UVICORN_PID"
