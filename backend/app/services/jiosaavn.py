@@ -216,8 +216,8 @@ class JioSaavnProvider(MusicProvider):
         clean_raw = re.sub(noise_pattern, " ", no_brackets)
         clean_raw = re.sub(r"[^\x00-\x7F]+", " ", clean_raw)
 
-        # 2. Extract delimited components (often: [Song Name] | [Album/Movie] | [Artists])
-        raw_parts = re.split(r"\||//|::", raw_title)
+        # 2. Extract delimited components (often: [Song Name] | [Album/Movie] | [Artists] or [Artist] - [Song])
+        raw_parts = re.split(r"\||//|::|\s+-\s+", raw_title)
         clean_parts: list[str] = []
         for p in raw_parts:
             cp = re.sub(r"[\(\[\{][^\)\]\}]*[\)\]\}]", " ", p)
@@ -297,9 +297,9 @@ class JioSaavnProvider(MusicProvider):
                                 if best_score >= 1.0:
                                     break
 
-                            # Verify confidence threshold (>= 0.70)
+                            # Verify confidence threshold (>= 0.60)
                             # Prevents returning random wrong tracks (e.g. devotional song for Bollywood)
-                            if best_match and best_score >= 0.70:
+                            if best_match and best_score >= 0.60:
                                 best_match["track_id"] = track_id
                                 best_match["provider_song_id"] = clean_id
                                 logger.info(
@@ -328,7 +328,7 @@ class JioSaavnProvider(MusicProvider):
                         if best_score >= 1.0:
                             break
 
-                    if best_match and best_score >= 0.70:
+                    if best_match and best_score >= 0.60:
                         best_match["track_id"] = track_id
                         return best_match
 

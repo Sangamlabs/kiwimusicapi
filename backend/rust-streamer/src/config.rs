@@ -20,7 +20,7 @@ impl Default for ProviderConfig {
             jiosaavn_timeout_secs: 15,
             ytdlp_executable: detect_ytdlp_executable(),
             ytdlp_timeout_secs: 30,
-            match_threshold: 0.70,
+            match_threshold: 0.60,
             allowed_media_hosts: Vec::new(),
             max_concurrency: 10,
         }

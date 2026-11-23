@@ -184,8 +184,8 @@ impl JioSaavnProvider {
             }
         }
 
-        // 1. Delimited components: [Song] | [Album/Movie] | [Artist]
-        let raw_parts: Vec<&str> = raw_title.split(['|', '/', ':']).collect();
+        // 1. Delimited components: [Song] | [Album/Movie] | [Artist] or [Artist] - [Song]
+        let raw_parts: Vec<&str> = raw_title.split(['|', '/', ':', '-']).collect();
         let mut clean_parts = Vec::new();
 
         for part in raw_parts {
