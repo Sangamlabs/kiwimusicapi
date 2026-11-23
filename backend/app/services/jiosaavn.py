@@ -81,6 +81,7 @@ class JioSaavnProvider(MusicProvider):
         return {
             "provider": "jiosaavn",
             "provider_song_id": song_id,
+            "saavn_id": song_id,
             "track_id": f"kiwi_saavn_{song_id}",
             "title": title,
             "artist": artist,
@@ -346,4 +347,70 @@ class JioSaavnProvider(MusicProvider):
                 "duration": track.get("duration", 0)
             }
         return None
+
+    async def get_recommendations(self, track_id: str, limit: int = 10) -> list[dict[str, Any]]:
+        """
+        Fetch recommended / similar tracks for autoplay or radio.
+        Uses JioSaavn reco.getreco API with artist/title search fallback.
+        """
+        clean_track_id = track_id.strip()
+        song_id = clean_track_id.replace("kiwi_saavn_", "").strip()
+
+        # 1. Resolve track metadata first to obtain exact saavn_id or artist/title
+        track_meta = await self.get_track(clean_track_id)
+        saavn_id = ""
+        artist = ""
+        title = ""
+
+        if track_meta:
+            saavn_id = track_meta.get("saavn_id") or ""
+            artist = track_meta.get("artist") or ""
+            title = track_meta.get("title") or ""
+
+        if not saavn_id and len(song_id) < 15 and not song_id.startswith("http"):
+            saavn_id = song_id
+
+        results: list[dict[str, Any]] = []
+
+        # 2. Query JioSaavn native recommendation engine (reco.getreco)
+        if saavn_id:
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout, headers=self.headers) as client:
+                    params = {
+                        "__call": "reco.getreco",
+                        "_format": "json",
+                        "_marker": "0",
+                        "cc": "in",
+                        "pid": saavn_id,
+                    }
+                    resp = await client.get("https://www.jiosaavn.com/api.php", params=params)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        raw_list = data.get(saavn_id) or []
+                        if isinstance(data, list):
+                            raw_list = data
+                        for item in raw_list:
+                            norm = self._normalize_item(item)
+                            # Exclude seed track itself
+                            if norm.get("provider_song_id") != saavn_id and norm.get("track_id") != clean_track_id:
+                                results.append(norm)
+                            if len(results) >= limit:
+                                break
+            except Exception as e:
+                logger.warning("JioSaavn reco.getreco failed for %s: %s", saavn_id, e)
+
+        # 3. Fallback: Search by artist or title if reco.getreco returned too few items
+        if len(results) < limit and (artist or title):
+            query = f"{artist} songs" if artist and artist != "Unknown Artist" else title
+            try:
+                fallback_results = await self.search(query, limit=limit + 2)
+                for item in fallback_results:
+                    if item.get("track_id") != clean_track_id and not any(r["track_id"] == item["track_id"] for r in results):
+                        results.append(item)
+                    if len(results) >= limit:
+                        break
+            except Exception as e:
+                logger.warning("Autoplay fallback search failed: %s", e)
+
+        return results[:limit]
 

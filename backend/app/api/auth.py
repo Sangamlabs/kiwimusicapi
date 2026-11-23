@@ -10,20 +10,23 @@ from app.utils import hash_api_key
 async def get_api_key(
     x_api_key: str | None = Header(None, alias="X-API-Key"),
     kiwiapi_header: str | None = Header(None, alias="KIWIAPI"),
+    anayaapi_header: str | None = Header(None, alias="ANAYAAPI"),
     authorization: str | None = Header(None, alias="Authorization"),
     api_key_query: str | None = Query(None, alias="api_key"),
     kiwiapi_query: str | None = Query(None, alias="kiwiapi"),
+    anayaapi_query: str | None = Query(None, alias="anayaapi"),
     db: AsyncSession = Depends(get_db)
 ) -> ApiKey:
     """
     Validate API key from header or query param against database and quota limits.
     Supports:
       - Header 'X-API-Key'
-      - Header 'KIWIAPI' (direct environment variable name match)
+      - Header 'KIWIAPI'
+      - Header 'ANAYAAPI'
       - Header 'Authorization: Bearer <key>'
-      - Query param '?api_key=<key>' or '?kiwiapi=<key>'
+      - Query param '?api_key=<key>', '?kiwiapi=<key>', '?anayaapi=<key>'
     """
-    raw_key = x_api_key or kiwiapi_header or api_key_query or kiwiapi_query
+    raw_key = x_api_key or kiwiapi_header or anayaapi_header or api_key_query or kiwiapi_query or anayaapi_query
     if not raw_key and authorization:
         if authorization.lower().startswith("bearer "):
             raw_key = authorization[7:].strip()

@@ -41,6 +41,46 @@ class ResolveResponse(BaseModel):
     cached: bool
     duration: int
 
+class RecommendationsResponse(BaseModel):
+    success: bool = True
+    seed_track_id: str
+    count: int
+    results: list[TrackSearchResult]
+
+class AutoplayResponse(BaseModel):
+    success: bool = True
+    seed_track_id: str
+    track_id: str
+    title: str
+    artist: str
+    album: str | None = None
+    duration: int
+    thumbnail: str | None = None
+    music_url: str
+    storage: str = "jiosaavn_direct"
+    storage_uid: str | None = None
+    cached: bool = False
+    count: int = 0
+    recommendations: list[TrackSearchResult] = Field(default_factory=list)
+
+class PlayforceRequest(BaseModel):
+    query: str | None = None
+    track_id: str | None = None
+
+class PlayforceResponse(BaseModel):
+    success: bool = True
+    force: bool = True
+    track_id: str
+    title: str
+    artist: str
+    album: str | None = None
+    duration: int
+    thumbnail: str | None = None
+    storage: str = "jiosaavn_direct"
+    storage_uid: str | None = None
+    music_url: str
+    cached: bool = False
+
 class UsageResponse(BaseModel):
     success: bool = True
     key_prefix: str

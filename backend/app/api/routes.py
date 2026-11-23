@@ -9,7 +9,11 @@ from app.config import settings
 from app.database import get_db
 from app.models import ApiKey
 from app.schemas import (
+    AutoplayResponse,
     HealthResponse,
+    PlayforceRequest,
+    PlayforceResponse,
+    RecommendationsResponse,
     ResolveResponse,
     SearchResponse,
     TrackDetailResponse,
@@ -107,16 +111,17 @@ async def track_detail_endpoint(
 @router.get("/resolve/{track_id}", response_model=ResolveResponse)
 async def resolve_endpoint(
     track_id: str,
+    force: bool = Query(False, description="Force instant direct provider resolution bypassing storage upload"),
     api_key: ApiKey = Depends(get_api_key),
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Resolve track to Yukisbox storage URL.
+    Resolve track to Yukisbox storage URL or direct stream URL.
     Billable endpoint: Consumes 1 quota unit upon success. Failed attempts do NOT consume quota.
     """
     start_time = time.time()
     try:
-        data = await music_service.resolve(track_id, db)
+        data = await music_service.resolve(track_id, db, force=force)
         latency_ms = (time.time() - start_time) * 1000
 
         # Atomically consume quota for successful resolution
@@ -155,6 +160,175 @@ async def resolve_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": "RESOLUTION_FAILED", "message": str(e)}
         )
+
+@router.get("/recommendations/{track_id}", response_model=RecommendationsResponse)
+async def recommendations_endpoint(
+    track_id: str,
+    limit: int = Query(10, ge=1, le=50, description="Number of recommendations to return"),
+    api_key: ApiKey = Depends(get_api_key)
+):
+    """
+    Fetch recommended / similar tracks for a seed track.
+    (Free endpoint, does not consume quota).
+    """
+    recos = await music_service.get_recommendations(track_id, limit=limit)
+    items = [
+        TrackSearchResult(
+            track_id=r["track_id"],
+            title=r["title"],
+            artist=r["artist"],
+            album=r.get("album"),
+            duration=r.get("duration", 0),
+            thumbnail=r.get("thumbnail")
+        )
+        for r in recos
+    ]
+    return RecommendationsResponse(
+        success=True,
+        seed_track_id=track_id,
+        count=len(items),
+        results=items
+    )
+
+@router.get("/autoplay/{track_id}", response_model=AutoplayResponse)
+async def autoplay_endpoint(
+    track_id: str,
+    limit: int = Query(10, ge=1, le=50, description="Recommendation list depth"),
+    api_key: ApiKey = Depends(get_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Continuous Autoplay Engine: Delivers similar tracks and pre-resolves the immediate next song
+    so music bots can stream continuously without silence.
+    Billable endpoint: Consumes 1 quota unit upon successful next track resolution.
+    """
+    start_time = time.time()
+    try:
+        data = await music_service.autoplay(track_id, db, limit=limit)
+        latency_ms = (time.time() - start_time) * 1000
+
+        quota_ok = await consume_quota_atomic(db, api_key.id, "/v1/autoplay", latency_ms)
+        if not quota_ok:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "QUOTA_EXHAUSTED", "message": "API key quota has been exhausted"}
+            )
+
+        reco_items = [
+            TrackSearchResult(
+                track_id=r["track_id"],
+                title=r["title"],
+                artist=r["artist"],
+                album=r.get("album"),
+                duration=r.get("duration", 0),
+                thumbnail=r.get("thumbnail")
+            )
+            for r in data.get("recommendations", [])
+        ]
+
+        return AutoplayResponse(
+            success=True,
+            seed_track_id=data["seed_track_id"],
+            track_id=data["track_id"],
+            title=data["title"],
+            artist=data["artist"],
+            album=data.get("album"),
+            duration=data.get("duration", 0),
+            thumbnail=data.get("thumbnail"),
+            music_url=data["music_url"],
+            storage=data.get("storage", "jiosaavn_direct"),
+            storage_uid=data.get("storage_uid"),
+            cached=data.get("cached", False),
+            count=len(reco_items),
+            recommendations=reco_items
+        )
+    except HTTPException:
+        raise
+    except ValueError as e:
+        latency_ms = (time.time() - start_time) * 1000
+        await record_failed_request(db, api_key.id, "/v1/autoplay", 404, latency_ms)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "AUTOPLAY_FAILED", "message": str(e)}
+        )
+    except Exception as e:
+        latency_ms = (time.time() - start_time) * 1000
+        await record_failed_request(db, api_key.id, "/v1/autoplay", 500, latency_ms)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": "AUTOPLAY_FAILED", "message": str(e)}
+        )
+
+@router.api_route("/playforce/{target:path}", methods=["GET", "POST"], response_model=PlayforceResponse)
+async def playforce_get_endpoint(
+    target: str,
+    api_key: ApiKey = Depends(get_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Playforce / Force-Play Engine: Immediately resolves target (song title, query, or track ID)
+    with top priority and delivers instant stream URL.
+    Billable endpoint: Consumes 1 quota unit upon successful playback resolution.
+    """
+    start_time = time.time()
+    try:
+        data = await music_service.playforce(target, db)
+        latency_ms = (time.time() - start_time) * 1000
+
+        quota_ok = await consume_quota_atomic(db, api_key.id, "/v1/playforce", latency_ms)
+        if not quota_ok:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "QUOTA_EXHAUSTED", "message": "API key quota has been exhausted"}
+            )
+
+        return PlayforceResponse(
+            success=True,
+            force=True,
+            track_id=data["track_id"],
+            title=data["title"],
+            artist=data["artist"],
+            album=data.get("album"),
+            duration=data.get("duration", 0),
+            thumbnail=data.get("thumbnail"),
+            storage=data.get("storage", "jiosaavn_direct"),
+            storage_uid=data.get("storage_uid"),
+            music_url=data["music_url"],
+            cached=data.get("cached", False)
+        )
+    except HTTPException:
+        raise
+    except ValueError as e:
+        latency_ms = (time.time() - start_time) * 1000
+        await record_failed_request(db, api_key.id, "/v1/playforce", 404, latency_ms)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "TRACK_NOT_FOUND", "message": str(e)}
+        )
+    except Exception as e:
+        latency_ms = (time.time() - start_time) * 1000
+        await record_failed_request(db, api_key.id, "/v1/playforce", 500, latency_ms)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": "PLAYFORCE_FAILED", "message": str(e)}
+        )
+
+@router.post("/playforce", response_model=PlayforceResponse)
+async def playforce_post_endpoint(
+    payload: PlayforceRequest,
+    api_key: ApiKey = Depends(get_api_key),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Playforce / Force-Play Engine via JSON body: {"query": "..."} or {"track_id": "..."}.
+    """
+    target = payload.track_id or payload.query
+    if not target or not target.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "INVALID_REQUEST", "message": "Either 'track_id' or 'query' must be provided in JSON payload"}
+        )
+    return await playforce_get_endpoint(target=target, api_key=api_key, db=db)
 
 @router.api_route("/stream/{track_id}", methods=["GET", "HEAD"])
 async def stream_endpoint(

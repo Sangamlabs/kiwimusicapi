@@ -70,14 +70,15 @@ class MusicService:
 
         return None
 
-    async def resolve(self, track_id: str, db: AsyncSession) -> dict[str, Any]:
+    async def resolve(self, track_id: str, db: AsyncSession, force: bool = False) -> dict[str, Any]:
         """
         Acquire, cache, and deliver storage URL for a track.
         Guarantees single-flight upload and database deduplication.
+        If force=True, delivers direct stream URL immediately with high priority.
         """
         cache_key = f"resolve:{track_id}"
         cached_url = cache.get(cache_key)
-        if cached_url:
+        if cached_url and not force:
             res = await db.execute(select(Track).where(Track.track_id == track_id))
             track = res.scalar_one_or_none()
             if track and track.storage_url and track.status == "available":
@@ -95,7 +96,7 @@ class MusicService:
         # 1. DB Check
         res = await db.execute(select(Track).where(Track.track_id == track_id))
         track = res.scalar_one_or_none()
-        if track and track.storage_url and track.status == "available":
+        if track and track.storage_url and track.status == "available" and not force:
             cache.set(cache_key, track.storage_url, ttl=7200)
             return {
                 "track_id": track.track_id,
@@ -114,7 +115,7 @@ class MusicService:
             # Re-check DB in case concurrent flight completed upload
             res = await db.execute(select(Track).where(Track.track_id == track_id))
             track = res.scalar_one_or_none()
-            if track and track.storage_url and track.status == "available":
+            if track and track.storage_url and track.status == "available" and not force:
                 cache.set(cache_key, track.storage_url, ttl=7200)
                 return {
                     "track_id": track.track_id,
@@ -212,9 +213,9 @@ class MusicService:
                 source_url = p_data["source_url"]
                 target_slug = sanitize_slug(f"{p_data['title']}_{p_data['artist']}_{p_data['provider_song_id']}")
 
-                # If storage upload is disabled, deliver direct provider stream URL instantly (< 0.3s)
-                if not getattr(settings, "STORAGE_UPLOAD_ENABLED", True):
-                    logger.info("Storage upload disabled; delivering direct provider stream for %s", track_id)
+                # If force play or storage upload is disabled, deliver direct provider stream URL instantly (< 0.3s)
+                if force or not getattr(settings, "STORAGE_UPLOAD_ENABLED", True):
+                    logger.info("Delivering immediate direct provider stream for %s (force=%s)", track_id, force)
                     if job:
                         job.status = "COMPLETED"
                         job.locked_at = None
@@ -348,6 +349,66 @@ class MusicService:
                     except Exception:
                         pass
                 raise e
+
+    async def get_recommendations(self, track_id: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Fetch recommended similar tracks for a track."""
+        cache_key = f"reco:{track_id}:{limit}"
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+
+        results = await self.provider.get_recommendations(track_id, limit=limit)
+        if results:
+            cache.set(cache_key, results, ttl=1800)
+        return results
+
+    async def autoplay(self, track_id: str, db: AsyncSession, limit: int = 10) -> dict[str, Any]:
+        """
+        Autoplay engine: delivers recommendations and pre-resolves the immediate next track
+        so the music bot can stream continuously with zero gap.
+        """
+        recos = await self.get_recommendations(track_id, limit=limit)
+        if not recos:
+            raise ValueError(f"No autoplay recommendations found for track '{track_id}'")
+
+        next_track_info = recos[0]
+        # Pre-resolve the next track for zero-gap playback
+        resolved_next = await self.resolve(next_track_info["track_id"], db, force=True)
+
+        return {
+            "seed_track_id": track_id,
+            "track_id": resolved_next["track_id"],
+            "title": resolved_next["title"],
+            "artist": resolved_next["artist"],
+            "album": next_track_info.get("album"),
+            "duration": resolved_next.get("duration", next_track_info.get("duration", 0)),
+            "thumbnail": next_track_info.get("thumbnail"),
+            "music_url": resolved_next["music_url"],
+            "storage": resolved_next.get("storage", "jiosaavn_direct"),
+            "storage_uid": resolved_next.get("storage_uid"),
+            "cached": resolved_next.get("cached", False),
+            "count": len(recos),
+            "recommendations": recos
+        }
+
+    async def playforce(self, target: str, db: AsyncSession) -> dict[str, Any]:
+        """
+        Playforce / Force-play engine: immediately resolves track or query with top priority,
+        bypassing background queues, locks, and storage uploads.
+        """
+        clean_target = target.strip()
+        target_track_id = clean_target
+
+        # If input looks like a search query rather than a track ID, find best match
+        if not (clean_target.startswith("kiwi_saavn_") or clean_target.startswith("anaya_") or (len(clean_target) == 11 and " " not in clean_target)):
+            search_res = await self.search(clean_target, limit=1, db=db)
+            if not search_res:
+                raise ValueError(f"No track found matching playforce query '{clean_target}'")
+            target_track_id = search_res[0]["track_id"]
+
+        data = await self.resolve(target_track_id, db, force=True)
+        data["force"] = True
+        return data
 
 music_service = MusicService()
 
