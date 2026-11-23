@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     )
     LIFETIME_QUOTA: int = Field(
         default=200,
-        description="Lifetime successful requests quota per API key"
+        description="Lifetime successful requests quota per API key (set to 9999999999 in .env for unlimited)"
     )
     RUST_MEDIA_PORT: int = Field(
         default=8088,

@@ -34,9 +34,9 @@ class ApiKey(Base):
     api_key = Column(String(64), nullable=True)  # Plaintext key for retrieval/copying by owner
     key_hash = Column(String(64), unique=True, index=True, nullable=False)
     key_prefix = Column(String(16), index=True, nullable=False)
-    total_quota = Column(Integer, default=200, nullable=False)
-    used_requests = Column(Integer, default=0, nullable=False)
-    failed_requests = Column(Integer, default=0, nullable=False)
+    total_quota = Column(BigInteger, default=200, nullable=False)
+    used_requests = Column(BigInteger, default=0, nullable=False)
+    failed_requests = Column(BigInteger, default=0, nullable=False)
     status = Column(String(32), default="active", index=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     revoked_at = Column(DateTime, nullable=True)

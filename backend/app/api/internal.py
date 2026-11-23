@@ -4,6 +4,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.auth import verify_internal_secret
+from app.config import settings
 from app.database import get_db
 from app.models import ApiKey, ApiUsage, Track, User
 from app.schemas import (
@@ -78,7 +79,7 @@ async def generate_key_endpoint(
         api_key=plaintext_key,
         key_hash=key_hash,
         key_prefix=key_prefix,
-        total_quota=200,
+        total_quota=getattr(settings, "LIFETIME_QUOTA", 9999999999),
         used_requests=0,
         failed_requests=0,
         status="active"
