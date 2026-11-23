@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:17
+    container_name: anaya-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-anaya}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-anaya}
+    volumes:
+      - anaya-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-anaya} -d ${POSTGRES_DB:-anaya}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.lite
+    container_name: anaya
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-anaya}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-anaya}
+      PORT: 8000
+      STORAGE_UPLOAD_ENABLED: ${STORAGE_UPLOAD_ENABLED:-false}
+      RUST_MEDIA_ENGINE_URL: ${RUST_MEDIA_ENGINE_URL:-}
+    volumes:
+      - ./temp:/app/temp
+
+volumes:
+  anaya-pgdata:

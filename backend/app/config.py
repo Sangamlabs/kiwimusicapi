@@ -21,6 +21,10 @@ class Settings(BaseSettings):
         default=300,
         description="Yukisbox request timeout in seconds"
     )
+    STORAGE_UPLOAD_ENABLED: bool = Field(
+        default=True,
+        description="Whether to upload tracks to Yukisbox persistent storage. When False, delivers direct provider stream URLs instantly."
+    )
     JIOSAAVN_BASE_URL: str = Field(
         default="",
         description="Optional upstream JioSaavn API base URL"

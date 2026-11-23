@@ -212,6 +212,27 @@ class MusicService:
                 source_url = p_data["source_url"]
                 target_slug = sanitize_slug(f"{p_data['title']}_{p_data['artist']}_{p_data['provider_song_id']}")
 
+                # If storage upload is disabled, deliver direct provider stream URL instantly (< 0.3s)
+                if not getattr(settings, "STORAGE_UPLOAD_ENABLED", True):
+                    logger.info("Storage upload disabled; delivering direct provider stream for %s", track_id)
+                    if job:
+                        job.status = "COMPLETED"
+                        job.locked_at = None
+                        job.completed_at = datetime.utcnow()
+                        job.updated_at = datetime.utcnow()
+                        await db.commit()
+                    cache.set(cache_key, source_url, ttl=3600)
+                    return {
+                        "track_id": track_id,
+                        "title": p_data.get("title", "Unknown Title"),
+                        "artist": p_data.get("artist", "Unknown Artist"),
+                        "storage": "jiosaavn_direct",
+                        "storage_uid": p_data.get("provider_song_id", track_id),
+                        "music_url": source_url,
+                        "cached": False,
+                        "duration": p_data.get("duration", 0)
+                    }
+
                 # 4. Upload to Yukisbox (Method A with Method B fallback)
                 storage_res = None
                 try:
@@ -235,6 +256,8 @@ class MusicService:
                                         await f.write(chunk)
 
                         storage_res = await self.storage.upload_file(temp_file, custom_slug=target_slug)
+                    except Exception as e:
+                        logger.warning("Method B failed (%s).", e)
                     finally:
                         if os.path.exists(temp_file):
                             try:
