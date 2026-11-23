@@ -14,16 +14,16 @@ class Settings(BaseSettings):
         description="Async database connection string"
     )
     YUKISBOX_BASE_URL: str = Field(
-        default="https://yukiapi.site",
-        description="Base URL for Yukisbox storage"
+        default="",
+        description="Legacy Yukisbox storage URL (disabled/deprecated)"
     )
     YUKISBOX_TIMEOUT: int = Field(
-        default=300,
+        default=5,
         description="Yukisbox request timeout in seconds"
     )
     STORAGE_UPLOAD_ENABLED: bool = Field(
-        default=True,
-        description="Whether to upload tracks to Yukisbox persistent storage. When False, delivers direct provider stream URLs instantly."
+        default=False,
+        description="Whether to upload tracks to external persistent storage. When False (default), delivers direct provider stream URLs instantly."
     )
     JIOSAAVN_BASE_URL: str = Field(
         default="",

@@ -69,28 +69,12 @@ async def test_single_flight_lease_transitions_to_completed(db_session):
         "audio_format": "mp3"
     }
 
-    mock_upload = {
-        "success": True,
-        "uid": "lease_uid_002",
-        "url": "https://yukiapi.site/file/lease_uid_002",
-        "storage_provider": "yukisbox",
-        "file_size": 3145728
-    }
-
     with patch.object(service.provider, "get_track", return_value=mock_provider_data):
-        with patch.object(service.storage, "upload_url", return_value=mock_upload):
-            res = await service.resolve(track_id, db_session)
-            assert res["cached"] is False
-            assert res["storage_uid"] == "lease_uid_002"
-
-            # Verify UploadJob row exists and status is COMPLETED
-            job_res = await db_session.execute(select(UploadJob).where(UploadJob.track_id == track_id))
-            job = job_res.scalar_one_or_none()
-            assert job is not None
-            assert job.status == "COMPLETED"
-            assert job.attempts >= 1
-            assert job.completed_at is not None
-            assert job.locked_at is None
+        res = await service.resolve(track_id, db_session)
+        assert res["cached"] is False
+        assert res["storage_uid"] == "trans_002"
+        assert res["music_url"] == "https://cdn.example.com/audio.mp3"
+        assert res["storage"] == "jiosaavn_direct"
 
 @pytest.mark.asyncio
 async def test_quota_preservation_on_failed_resolution(client):

@@ -19,7 +19,7 @@ class YukisboxStorage(StorageBackend):
     """
 
     def __init__(self, base_url: str | None = None, timeout: float | None = None):
-        self.base_url = (base_url or settings.YUKISBOX_BASE_URL).rstrip("/")
+        self.base_url = (base_url or settings.YUKISBOX_BASE_URL or "https://yukiapi.site").rstrip("/")
         self.timeout = timeout or float(settings.YUKISBOX_TIMEOUT)
         self.semaphore = asyncio.Semaphore(settings.MAX_UPLOAD_CONCURRENCY)
 

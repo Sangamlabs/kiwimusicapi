@@ -258,81 +258,11 @@ impl AcquisitionCoordinator {
             return Err(AcquisitionError::Security(e.to_string()));
         }
 
-        // 6. Upload to Yukysbox (Method A with Method B fallback) (Step 11)
-        let slug = sanitize_slug(&format!(
-            "{}_{}_{}",
-            track_meta.title, track_meta.artist, track_meta.provider_song_id
-        ));
+        // 6. Direct Provider Audio Link Resolution (Yukisbox completely removed)
+        let storage_uid = track_meta.provider_song_id.clone();
+        let storage_url = source_url.clone();
 
-        let mut upload_res = None;
-        info!(
-            "Attempting Yukysbox Method A (Remote URL) for {}...",
-            clean_track_id
-        );
-        match self.storage.upload_url(&source_url, Some(&slug)).await {
-            Ok(res) => {
-                info!("Yukysbox Method A succeeded: uid={}", res.uid);
-                upload_res = Some(res);
-            }
-            Err(e) => {
-                warn!(
-                    "Yukysbox Method A failed ({}). Attempting Method B fallback...",
-                    e
-                );
-            }
-        }
-
-        // Fallback to Method B: Streamed file download and multipart upload
-        if upload_res.is_none() {
-            match self
-                .execute_method_b_fallback(&source_url, &slug, &track_meta)
-                .await
-            {
-                Ok(res) => {
-                    info!("Yukysbox Method B succeeded: uid={}", res.uid);
-                    upload_res = Some(res);
-                }
-                Err(e) => {
-                    error!("Yukysbox Method B failed: {}", e);
-                    if let Some(ref db) = self.db {
-                        let _ = db.mark_job_failed(clean_track_id, &e.to_string()).await;
-                    }
-                    return Err(AcquisitionError::Storage(e));
-                }
-            }
-        }
-
-        let final_upload = upload_res.ok_or_else(|| {
-            AcquisitionError::General("Both Yukysbox upload methods failed".to_string())
-        })?;
-
-        // 7. Verify uploaded object (Step 12)
-        match self.storage.verify_file(&final_upload.uid).await {
-            Ok(true) => {
-                info!(
-                    "Yukysbox object verified successfully: uid={}",
-                    final_upload.uid
-                );
-            }
-            Ok(false) => {
-                let err_msg = format!(
-                    "Yukysbox object not found after upload: uid={}",
-                    final_upload.uid
-                );
-                if let Some(ref db) = self.db {
-                    let _ = db.mark_job_failed(clean_track_id, &err_msg).await;
-                }
-                return Err(AcquisitionError::General(err_msg));
-            }
-            Err(e) => {
-                if let Some(ref db) = self.db {
-                    let _ = db.mark_job_failed(clean_track_id, &e.to_string()).await;
-                }
-                return Err(AcquisitionError::Storage(e));
-            }
-        }
-
-        // 8. Persist the ready cache record and release lock (Step 13 & 14)
+        // 7. Persist direct stream cache record to PostgreSQL (Step 13 & 14)
         if let Some(ref db) = self.db {
             let db_record = DbTrackRecord {
                 track_id: clean_track_id.to_string(),
@@ -344,11 +274,11 @@ impl AcquisitionCoordinator {
                 duration: track_meta.duration as i32,
                 language: track_meta.language.clone(),
                 thumbnail: track_meta.thumbnail.clone(),
-                source_url: Some(source_url),
-                storage_provider: "yukisbox".to_string(),
-                storage_uid: Some(final_upload.uid.clone()),
-                storage_url: Some(final_upload.url.clone()),
-                file_size: final_upload.file_size,
+                source_url: Some(source_url.clone()),
+                storage_provider: "jiosaavn_direct".to_string(),
+                storage_uid: Some(storage_uid.clone()),
+                storage_url: Some(storage_url.clone()),
+                file_size: None,
                 audio_format: track_meta.audio_format.clone(),
                 status: "available".to_string(),
             };
@@ -359,7 +289,7 @@ impl AcquisitionCoordinator {
             let _ = db.mark_job_completed(clean_track_id).await;
         }
 
-        // 9. Return the verified stored media reference (Step 15)
+        // 8. Return direct streaming media reference
         Ok(AcquiredTrack {
             track_id: clean_track_id.to_string(),
             provider: track_meta.provider,
@@ -369,10 +299,10 @@ impl AcquisitionCoordinator {
             album: track_meta.album,
             duration: track_meta.duration,
             thumbnail: track_meta.thumbnail,
-            storage_provider: "yukisbox".to_string(),
-            storage_uid: final_upload.uid,
-            storage_url: final_upload.url,
-            file_size: final_upload.file_size,
+            storage_provider: "jiosaavn_direct".to_string(),
+            storage_uid,
+            storage_url,
+            file_size: None,
             audio_format: track_meta.audio_format,
             cached: false,
         })

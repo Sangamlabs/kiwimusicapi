@@ -169,22 +169,22 @@ async fn resolve_stream_target(
         }
         Err(e) => {
             warn!(
-                "Stream: yt-dlp resolution error for '{}': {}. Falling back to Yukysbox.",
+                "Stream: yt-dlp resolution error for '{}': {}. Falling back to acquisition coordinator.",
                 clean_track_id, e
             );
         }
     }
 
-    // 4. Fallback Storage Workflow: Yukysbox Persistent Cache/Acquisition
+    // 4. Fallback Workflow: Acquisition Coordinator (Direct provider stream resolution)
     info!(
-        "Stream: All direct providers failed. Invoking Yukysbox fallback for '{}'...",
+        "Stream: All direct providers unindexed. Invoking acquisition coordinator for '{}'...",
         clean_track_id
     );
     match state.coordinator.acquire(clean_track_id, None).await {
         Ok(acquired) => {
             if let Ok(safe_url) = validate_url_ssrf(&acquired.storage_url) {
                 info!(
-                    "Stream: Resolved Yukysbox storage URL for '{}'",
+                    "Stream: Resolved direct stream URL for '{}'",
                     clean_track_id
                 );
                 return Ok(CachedStreamUrl {
@@ -196,7 +196,7 @@ async fn resolve_stream_target(
         }
         Err(e) => {
             error!(
-                "Stream: Yukysbox acquisition fallback failed for '{}': {}",
+                "Stream: Direct acquisition fallback failed for '{}': {}",
                 clean_track_id, e
             );
         }

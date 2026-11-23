@@ -259,7 +259,7 @@ async def autoplay_endpoint(
             detail={"code": "AUTOPLAY_FAILED", "message": str(e)}
         )
 
-@router.api_route("/playforce/{target:path}", methods=["GET", "POST"], response_model=PlayforceResponse)
+@router.api_route("/playforce/{target:path}", methods=["GET", "POST"], response_model=PlayforceResponse, operation_id="playforce_target_endpoint")
 async def playforce_get_endpoint(
     target: str,
     api_key: ApiKey = Depends(get_api_key),
@@ -313,7 +313,7 @@ async def playforce_get_endpoint(
             detail={"code": "PLAYFORCE_FAILED", "message": str(e)}
         )
 
-@router.post("/playforce", response_model=PlayforceResponse)
+@router.post("/playforce", response_model=PlayforceResponse, operation_id="playforce_json_endpoint")
 async def playforce_post_endpoint(
     payload: PlayforceRequest,
     api_key: ApiKey = Depends(get_api_key),
@@ -330,7 +330,7 @@ async def playforce_post_endpoint(
         )
     return await playforce_get_endpoint(target=target, api_key=api_key, db=db)
 
-@router.api_route("/stream/{track_id}", methods=["GET", "HEAD"])
+@router.api_route("/stream/{track_id}", methods=["GET", "HEAD"], operation_id="stream_track_endpoint")
 async def stream_endpoint(
     track_id: str,
     request: Request,

@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime
 import logging
 import os
+import re
 import secrets
 from typing import Any
 import aiofiles
@@ -109,6 +110,77 @@ class MusicService:
                 "duration": track.duration
             }
 
+        # 1.5 FAST PATH: When force=True or STORAGE_UPLOAD_ENABLED is False (Yukisbox removed),
+        # delivers authorized provider audio stream instantly in < 0.3s with in-flight deduplication!
+        if force or not getattr(settings, "STORAGE_UPLOAD_ENABLED", False):
+            track_lock = await self._get_track_lock(track_id)
+            async with track_lock:
+                # Check DB inside single-flight lock in case concurrent flight resolved it
+                res = await db.execute(select(Track).where(Track.track_id == track_id))
+                track = res.scalar_one_or_none()
+                if track and track.storage_url and track.status == "available" and not force:
+                    cache.set(cache_key, track.storage_url, ttl=7200)
+                    return {
+                        "track_id": track.track_id,
+                        "title": track.title,
+                        "artist": track.artist,
+                        "storage": track.storage_provider,
+                        "storage_uid": track.storage_uid,
+                        "music_url": track.storage_url,
+                        "cached": True,
+                        "duration": track.duration
+                    }
+
+                logger.info("Delivering immediate direct provider stream for %s (force=%s)", track_id, force)
+                p_data = await self.provider.get_track(track_id)
+                if not p_data or not p_data.get("source_url"):
+                    raise ValueError(f"Unable to find track or authorized audio source for {track_id}")
+
+                source_url = p_data["source_url"]
+                cache.set(cache_key, source_url, ttl=3600)
+
+                # Persist to DB for instant subsequent hits
+                try:
+                    if not track:
+                        track = Track(
+                            track_id=track_id,
+                            provider=p_data.get("provider", "jiosaavn"),
+                            provider_song_id=p_data.get("provider_song_id", track_id),
+                            title=p_data.get("title", "Unknown Title"),
+                            artist=p_data.get("artist", "Unknown Artist"),
+                            album=p_data.get("album"),
+                            duration=p_data.get("duration", 0),
+                            language=p_data.get("language"),
+                            thumbnail=p_data.get("thumbnail"),
+                            source_url=source_url,
+                            storage_provider="jiosaavn_direct",
+                            storage_uid=p_data.get("provider_song_id", track_id),
+                            storage_url=source_url,
+                            file_size=None,
+                            audio_format=p_data.get("audio_format", "mp3"),
+                            status="available",
+                            created_at=datetime.utcnow(),
+                            updated_at=datetime.utcnow(),
+                            last_accessed_at=datetime.utcnow()
+                        )
+                        db.add(track)
+                        await db.commit()
+                except Exception as e:
+                    logger.debug("Fast path DB record notice for %s: %s", track_id, e)
+
+                return {
+                    "track_id": p_data.get("track_id", track_id),
+                    "title": p_data.get("title", "Unknown Title"),
+                    "artist": p_data.get("artist", "Unknown Artist"),
+                    "album": p_data.get("album"),
+                    "storage": "jiosaavn_direct",
+                    "storage_uid": p_data.get("provider_song_id", track_id),
+                    "music_url": source_url,
+                    "cached": False,
+                    "duration": p_data.get("duration", 0),
+                    "thumbnail": p_data.get("thumbnail"),
+                }
+
         # 2. In-Flight Single-Flight Lock
         track_lock = await self._get_track_lock(track_id)
         async with track_lock:
@@ -171,11 +243,11 @@ class MusicService:
             except Exception as e:
                 logger.warning("UploadJob lease notice for %s: %s", track_id, e)
 
-            # 2.5 Dispatch acquisition to Rust media engine if configured
-            if getattr(settings, "RUST_MEDIA_ENGINE_URL", None):
+            # 2.5 Dispatch acquisition to Rust media engine if configured and storage upload enabled
+            if getattr(settings, "RUST_MEDIA_ENGINE_URL", None) and getattr(settings, "STORAGE_UPLOAD_ENABLED", True):
                 try:
                     headers = {"X-Internal-Secret": getattr(settings, "INTERNAL_API_SECRET", "")}
-                    async with httpx.AsyncClient(timeout=40.0) as client:
+                    async with httpx.AsyncClient(timeout=8.0) as client:
                         acquire_resp = await client.post(
                             f"{settings.RUST_MEDIA_ENGINE_URL.rstrip('/')}/internal/acquire",
                             json={"track_id": track_id, "query": None},
@@ -367,16 +439,24 @@ class MusicService:
         Autoplay engine: delivers recommendations and pre-resolves the immediate next track
         so the music bot can stream continuously with zero gap.
         """
-        recos = await self.get_recommendations(track_id, limit=limit)
+        clean_seed = track_id.strip()
+
+        # If clean_seed looks like a query or raw title rather than a track_id
+        if not (clean_seed.startswith("kiwi_saavn_") or clean_seed.startswith("anaya_") or (len(clean_seed) == 11 and " " not in clean_seed)):
+            search_res = await self.search(clean_seed, limit=1, db=db)
+            if search_res:
+                clean_seed = search_res[0]["track_id"]
+
+        recos = await self.get_recommendations(clean_seed, limit=limit)
         if not recos:
-            raise ValueError(f"No autoplay recommendations found for track '{track_id}'")
+            raise ValueError(f"No autoplay recommendations found for track '{clean_seed}'")
 
         next_track_info = recos[0]
         # Pre-resolve the next track for zero-gap playback
         resolved_next = await self.resolve(next_track_info["track_id"], db, force=True)
 
         return {
-            "seed_track_id": track_id,
+            "seed_track_id": clean_seed,
             "track_id": resolved_next["track_id"],
             "title": resolved_next["title"],
             "artist": resolved_next["artist"],
@@ -399,8 +479,13 @@ class MusicService:
         clean_target = target.strip()
         target_track_id = clean_target
 
+        # Check for YouTube URL pattern: youtu.be/ID or v=ID or /embed/ID
+        yt_match = re.search(r"(?:v=|\/|youtu\.be\/)([0-9A-Za-z_-]{11})", clean_target)
+        if yt_match and not clean_target.startswith("kiwi_saavn_") and not clean_target.startswith("anaya_"):
+            target_track_id = yt_match.group(1)
+
         # If input looks like a search query rather than a track ID, find best match
-        if not (clean_target.startswith("kiwi_saavn_") or clean_target.startswith("anaya_") or (len(clean_target) == 11 and " " not in clean_target)):
+        if not (target_track_id.startswith("kiwi_saavn_") or target_track_id.startswith("anaya_") or (len(target_track_id) == 11 and " " not in target_track_id)):
             search_res = await self.search(clean_target, limit=1, db=db)
             if not search_res:
                 raise ValueError(f"No track found matching playforce query '{clean_target}'")

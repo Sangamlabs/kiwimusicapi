@@ -45,7 +45,8 @@ async def test_end_to_end_resolve_through_rust_acquisition(client):
         }
     })
 
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+    with patch("app.services.music.settings.STORAGE_UPLOAD_ENABLED", True), \
+         patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
         mock_post.return_value = mock_rust_acquire_resp
 
         # First Call: Uncached -> dispatches to Rust /internal/acquire
@@ -225,5 +226,6 @@ async def test_rust_offline_resolve_fallback_to_python(client):
         data = resp.json()
         assert data["success"] is True
         assert data["track_id"] == track_id
-        assert data["storage_uid"] == "uid_fallback_999"
-        assert data["music_url"] == "https://yukiapi.site/v1/file/uid_fallback_999"
+        assert data["storage_uid"] == "prov_down_01"
+        assert data["music_url"] == "https://aac.saavncdn.com/fallback.mp4"
+        assert data["storage"] == "jiosaavn_direct"
